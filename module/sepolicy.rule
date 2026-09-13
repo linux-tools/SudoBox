@@ -1,0 +1,39 @@
+#!/system/bin/sh
+###############################################################################
+# SudoBox / chroot-mgr — KernelSU module: sepolicy rules
+#
+# v0.1.1 重大修正：
+#   本文件原为一行 `allow * * * *`（全通配）。实机验证（PD2338, KSU）后果：
+#   KernelSU 经 handle_sepolicy() supercall 注入时会把通配（ALL）**展开**到所有
+#   匹配类型/类（内核 avtab 膨胀，见 KernelSU kernel/selinux 实现），
+#   /sys/fs/selinux/policy 由正常 ~1-3MB 暴涨至 ~221MB，全系统每次 SELinux
+#   检查（fork/exec/open…）都在巨型策略表上查找 → 系统严重卡顿、软重启
+#   （framework restart 不重载内核策略）耗时极长；且**卸载模块不会撤销已注入
+#   的内核策略**，必须完整重启才能恢复。
+#
+# 为什么本模块可以完全不提供规则：
+#   KernelSU 内核已内置 su 域全放行（apply_kernelsu_rules:
+#   ksu_permissive(su) + ksu_allow(su, ALL, ALL, ALL)）。本模块的
+#   customize.sh / service.sh / action.sh / App 的 `su -c chroot-mgr` 全部以
+#   su/root 域运行，天然具备 chroot/mount/unshare 所需权限，无需任何额外规则。
+#
+# 若未来在其它 root 框架（如 Magisk）下遇 avc denied，只能按"最小精确"补规则，
+# **严禁 `allow * * * *` 或任何通配源/通配目标**。参考形态（示例，需实测）：
+#   allow su su:capability { sys_chroot sys_admin sys_ptrace }
+#   allow su adb_data_file:dir { search read open getattr }
+#   allow su adb_data_file:file { read write execute open getattr map }
+###############################################################################
+
+###############################################################################
+# v0.1.20.1 (2026-09-08): App 仪表盘 CPU KPI 修复
+#   App 进程（untrusted_app 域）直读 /proc/loadavg 被 SELinux 拒绝（实测 avc:
+#   denied { read } tcontext=u:object_r:proc_loadavg:s0，PD2338 Android 15），
+#   loadAverage() 抛异常 → CPU 卡恒显示 "-"。
+#   本条为最小精确规则：源/目标/类/权限全部定死，无任何通配，
+#   不触发 KernelSU ALL 展开的 avtab 膨胀（见上方 v0.1.1 注）。
+#   语法注意：ksud 的 sepolicy 解析器为 magiskpolicy 形式（类不带冒号），
+#   写成 `proc_loadavg:file` 会 "Failed to parse policy statement"。
+#   实机（PD2338/ReSuKiSU）已验证：ksud sepolicy check/patch 通过，
+#   策略文件体积不变（2,176,196 B），avc 拒绝消失。
+allow untrusted_app proc_loadavg file { open read getattr }
+###############################################################################

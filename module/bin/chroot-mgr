@@ -1,0 +1,3118 @@
+#!/system/bin/sh
+###############################################################################
+# chroot-mgr — SudoBox container manager (chroot engine)
+#
+# 产品: SudoBox — "按需提权，即用即还"
+# 引擎: unshare -m + chroot（单一引擎，root 单形态）
+# 许可: GPL-3.0（沿用 linuxdeploy 组件系统思想）
+#
+# 设计锚点（SudoBox-开发思路.md v2.3.2）：
+#   D5  容器引擎 = 移植 linuxdeploy cli.sh + include/ 组件系统
+#   D6  每次操作临时 su -c 一次，无常驻 root 连接
+#   D7  状态同步 = 文件 <data>/.state + App 轮询
+#   D8  数据位置 = /data/adb/chroot-mgr/data/（模块代码目录外）
+#   D11 不写 /system、/vendor、init、持久化属性
+#   D21 单实例：全局至多一个 profile 处于 running/starting
+#   D22 进入前仲裁（switch）：先完整终止旧系统并校验清零，再启动目标
+#
+# 子命令（11）：enable disable enter switch exec status install svc
+#               export import diagnose help
+###############################################################################
+
+VERSION="0.1.25"
+PRODUCT="SudoBox"
+
+# ---------------------------------------------------------------------------
+# 常量路径
+# ---------------------------------------------------------------------------
+CM_DATA_DIR="${SUDOBOX_DATA_DIR:-/data/adb/chroot-mgr/data}"
+CM_PROFILES_DIR="${CM_DATA_DIR}/profiles"
+CM_CONFIG_DIR="${CM_DATA_DIR}/config"
+CM_TMP_DIR="${CM_DATA_DIR}/tmp"
+CM_STATE_FILE="${CM_DATA_DIR}/.state"
+CM_LOG_FILE="${CM_DATA_DIR}/chroot-mgr.log"
+
+# 终止宽限（D22：SIGTERM → 宽限 3s → SIGKILL）
+CM_TERM_GRACE=3
+
+# ---------------------------------------------------------------------------
+# 进程守护（v0.1.18）
+#   CM_GUARD_INTERVAL : 守护巡检间隔（秒）
+#   CM_GUARD_LOG_MAX  : guard.log 截断阈值（字节，超限砍半防止无限膨胀）
+#   SUDOBOX_NO_KEEPALIVE=1 : 整体关闭 cgroup 迁移 + oom 托底（调试用）
+# ---------------------------------------------------------------------------
+CM_GUARD_INTERVAL="${SUDOBOX_GUARD_INTERVAL:-30}"
+CM_GUARD_LOG_MAX=262144
+
+# ---------------------------------------------------------------------------
+# 全局监督 daemon（v0.1.24）
+#   CM_DAEMON_INTERVAL : 对账 tick 间隔（秒）
+#   CM_DAEMON_IDLE_TICKS : 无存活容器连续 N 轮 → 空转自杀（用户约束的兜底线）
+#   SUDOBOX_DAEMON_MAX_TICKS=1 : 有界自退（PC 测试钩子 + 防失控兜底，默认 0 不限）
+# ---------------------------------------------------------------------------
+CM_DAEMON_INTERVAL="${SUDOBOX_DAEMON_INTERVAL:-30}"
+CM_DAEMON_IDLE_TICKS="${SUDOBOX_DAEMON_IDLE_TICKS:-2}"
+
+# ---------------------------------------------------------------------------
+# 输出与日志
+# ---------------------------------------------------------------------------
+CM_QUIET=0
+
+msg()
+{
+    [ "${CM_QUIET}" = "1" ] && return 0
+    if [ "$1" = "-n" ]; then shift; echo -n "$@"; else echo "$@"; fi
+}
+warn() { echo "W: $*" >&2; }
+err()  { echo "E: $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+cm_log()
+{
+    [ -d "${CM_DATA_DIR}" ] || return 0
+    echo "[$(date '+%F %T')] $*" >> "${CM_LOG_FILE}" 2>/dev/null
+}
+
+# JSON 字符串转义（status --json 专用）
+#
+# 为什么必须有：字段值是裸插进 JSON 的，一旦含 " 或 \ 就会破坏整个结构，
+# App 侧 JSONObject 直接抛异常、状态页全白。实机触发场景不止一种：
+#   - 容器导入时 `--name` 填了带引号的名字（用户可控）
+#   - S_ERROR 里带上含引号的 shell 报错（最常见，路径/错误信息常带引号）
+#   - 描述符里 DISTRO_NAME / SUITE 含特殊字符
+# 换行与制表符一并压成空格：JSON 字符串不允许裸控制字符。
+cm_json_escape()
+{
+    printf '%s' "$1" \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+        | tr '\n\r\t' '   '
+}
+
+# 行清洗：把控制字符压成空格
+#
+# 为什么必须有：状态文件与 profile.conf 都是"每行一个 KEY=VALUE"的手写格式，
+# cm_state_read 逐行解析。任何字段值里的换行都会变成多行，等于允许往文件里
+# 注入伪造的 KEY=VALUE —— error_msg 恰好排在最后，注入一行 state=running
+# 就能把"已停止"伪造成"运行中"，App 侧状态页会显示错误信息。
+cm_sanitize_line()
+{
+    printf '%s' "$1" | tr '\n\r\t' '   '
+}
+
+# 容器 id 归一化：只保留 [A-Za-z0-9._-]，其余一律换成 _
+#
+# 为什么必须是白名单而不是黑名单：id 会同时流向三个地方——
+#   1) 作为目录名（profiles/<id>/rootfs），含 / 会越出目录、含换行会造出畸形路径；
+#   2) 写进 profile.conf（见 cm_sanitize_line，换行可伪造 KEY）；
+#   3) 经 status --json 回传给 App。
+# 黑名单逐个字符去堵迟早漏一个，白名单一次收口。
+# 注意用 printf 而非 echo：echo 会多输出一个换行，被 tr 换成 '_'，
+# 结果是每个导入的容器名都莫名多一个尾部下划线（debian -> debian_）。
+# 注意：这里保留 '-' 字符（ubuntu-resolute 等默认命名依赖它），也不在此拒绝
+# 前导 '-' —— 本函数是纯变换（cm_profile_dir 等 path helper 大量调用，die 会
+# 炸在错误位置）。前导 '-' 的拒绝放在创建入口：cm_do_install_import /
+# cm_profile_write_conf（v0.1.6）。
+cm_sanitize_id()
+{
+    printf '%s' "$1" | tr -c 'a-zA-Z0-9._-' '_'
+}
+
+# ---------------------------------------------------------------------------
+# 模块目录探测（KSU 新旧路径兼容）
+# ---------------------------------------------------------------------------
+cm_moddir()
+{
+    local d
+    for d in /data/adb/modules/chroot-mgr \
+             /data/adb/ksu/modules/chroot-mgr \
+             /data/adb/magisk/chroot-mgr; do
+        if [ -d "${d}/bin" ]; then echo "${d}"; return 0; fi
+    done
+    echo "/data/adb/modules/chroot-mgr"
+}
+
+CM_MODDIR="${CM_MODDIR:-$(cm_moddir)}"
+CM_BINDIR="${CM_MODDIR}/bin"
+CM_INCLUDE_DIR="${CM_MODDIR}/include"
+CM_HOOKS_DIR="${CM_INCLUDE_DIR}/hooks"
+CM_DISTRO_DIR="${CM_MODDIR}/distro"
+CM_DEFAULT_INCLUDE="core/mnt core/net core/profile"
+
+# ---------------------------------------------------------------------------
+# 工具链探测（busybox / unshare / chroot / tar）
+#   v0.1.2 关键改动：模块自带 busybox 最高优先
+#   - 为什么：KSU 自带 /data/adb/ksu/bin/busybox 是精简版，没有 unshare applet，
+#     在临时 root + SELinux 注入的 context 下，unshare 系统调用被拒绝，
+#     报 'busybox unshare: inaccessible or not found'，进入容器直接失败。
+#   - 修复：模块 bin/busybox 必须是 aarch64 静态（musl）含 unshare/chroot/mount/tar
+#     等关键 applet；探测时优先选它，并对每个 applet 做实际调用验证。
+#   - 完整性：cm_check_bb_applets 列出必须存在的 applet，少一个就判 busybox 不可用。
+# ---------------------------------------------------------------------------
+CM_REQUIRED_APPLETS="ash mount umount chroot unshare tar sed awk grep find xargs nsenter setpriv ps kill sleep wget cp mv rm ln ls cat head tail tr sort du df date readlink realpath dirname basename env printf"
+
+# v0.1.7: 实测 unshare(2) 系统调用是否可用。
+# applet 探测（--help）只能证明命令存在；unshare(2) 还需要：
+#   - 内核 CONFIG_USER_NS / CONFIG_PID_NS / CONFIG_MNT_NS 等编译选项
+#   - 当前进程有 CAP_SYS_ADMIN（KSU 注入 su context 通常有）
+#   - SELinux 没拦截（Enforcing 下 unshare 可能因 type transition 被拒）
+# 实测方法：`unshare -m /system/bin/true` 创建临时 mount namespace 并立即退出。
+#   退出码 0 → 内核支持，可设 CM_UNSHARE
+#   退出码非 0 → 内核不支持 / SELinux 拒绝，CM_UNSHARE="" 走 fallback
+# 注意：busybox 在 unshare(2) 失败时统一报 'inaccessible or not found'，
+# 只看退出码，不解析 stderr 关键字（避免 SELinux 加随机 prefix 误判）。
+cm_probe_unshare()
+{
+    local probe="$1"      # 例: "/data/adb/modules/chroot-mgr/bin/busybox unshare"
+    local cmd="${probe%% *}" applet="${probe#* }"
+    [ -x "${cmd}" ] || return 1
+    "${cmd}" "${applet}" -m /system/bin/true >/dev/null 2>&1
+}
+
+cm_check_bb_applets()
+{
+    local bb="$1" applet ok=1 missing=""
+    for applet in ${CM_REQUIRED_APPLETS}; do
+        if ! "${bb}" "${applet}" --help >/dev/null 2>&1 && \
+           ! "${bb}" "${applet}" -h >/dev/null 2>&1 && \
+           ! "${bb}" --list 2>/dev/null | tr -d ' ' | tr ',' '\n' | grep -qx "${applet}"; then
+            missing="${missing} ${applet}"
+            ok=0
+        fi
+    done
+    if [ "${ok}" = "0" ]; then
+        warn "busybox ${bb} 缺 applet:${missing}"
+        return 1
+    fi
+    return 0
+}
+
+cm_detect_tools()
+{
+    local cand
+    CM_BB=""
+
+    # 1) 模块自带 busybox 优先（v0.1.2+）
+    #    路径必须是 ${CM_BINDIR}/busybox（模块 bin/），是 KSU 安装时整体释放的。
+    if [ -x "${CM_BINDIR}/busybox" ] && cm_check_bb_applets "${CM_BINDIR}/busybox"; then
+        CM_BB="${CM_BINDIR}/busybox"
+    fi
+
+    # 2) 回退：KSU / Magisk / 系统 busybox（接受不完整，但 applet 在调用时才报错）
+    if [ -z "${CM_BB}" ]; then
+        for cand in /data/adb/ksu/bin/busybox /data/adb/magisk/busybox \
+                    /system/bin/busybox /system/xbin/busybox; do
+            if [ -x "${cand}" ]; then
+                CM_BB="${cand}"
+                warn "模块 busybox 不可用，回退到: ${cand}（applet 可能不全）"
+                break
+            fi
+        done
+    fi
+
+    # unshare：模块 busybox 优先（保证有），回退 KSU，再回退 toybox
+    # v0.1.7: 探测分两阶段——
+    #   1) applet 探测 (--help)：确认命令存在
+    #   2) 系统调用实测 (unshare -m true)：确认内核真支持 unshare(2)
+    # 旧版只做 1)，导致真机进入容器时 `unshare -m` 因 CONFIG_USER_NS/PID_NS=no
+    # 失败、busybox 报 'inaccessible or not found'、进程 exit 127。
+    # 修复：实测失败则 CM_UNSHARE=""，cm_enter_session 自动退化为直接 chroot 路径。
+    CM_UNSHARE=""
+    if [ -n "${CM_BB}" ] && "${CM_BB}" unshare --help >/dev/null 2>&1; then
+        if cm_probe_unshare "${CM_BB} unshare"; then
+            CM_UNSHARE="${CM_BB} unshare"
+        fi
+    elif [ -x /system/bin/toybox ] && /system/bin/toybox unshare --help >/dev/null 2>&1; then
+        if cm_probe_unshare "/system/bin/toybox unshare"; then
+            CM_UNSHARE="/system/bin/toybox unshare"
+        fi
+    elif [ -x /system/bin/unshare ] && cm_probe_unshare "/system/bin/unshare"; then
+        CM_UNSHARE="/system/bin/unshare"
+    fi
+
+    # chroot
+    CM_CHROOT=""
+    if [ -n "${CM_BB}" ] && "${CM_BB}" chroot --help >/dev/null 2>&1; then
+        CM_CHROOT="${CM_BB} chroot"
+    elif [ -x /system/bin/toybox ] && /system/bin/toybox chroot --help >/dev/null 2>&1; then
+        CM_CHROOT="/system/bin/toybox chroot"
+    elif [ -x /system/bin/chroot ]; then
+        CM_CHROOT="/system/bin/chroot"
+    fi
+
+    # mount / umount
+    if [ -n "${CM_BB}" ]; then
+        CM_MOUNT="${CM_BB} mount"
+        CM_UMOUNT="${CM_BB} umount"
+    elif [ -x /system/bin/toybox ]; then
+        CM_MOUNT="/system/bin/toybox mount"
+        CM_UMOUNT="/system/bin/toybox umount"
+    else
+        CM_MOUNT="mount"
+        CM_UMOUNT="umount"
+    fi
+
+    # tar
+    CM_TAR=""
+    if [ -n "${CM_BB}" ] && "${CM_BB}" tar --help >/dev/null 2>&1; then
+        CM_TAR="${CM_BB} tar"
+    elif [ -x /system/bin/toybox ] && /system/bin/toybox tar --help >/dev/null 2>&1; then
+        CM_TAR="/system/bin/toybox tar"
+    elif command -v tar >/dev/null 2>&1; then
+        CM_TAR="tar"
+    fi
+
+    # 下载器
+    CM_WGET=""
+    if [ -n "${CM_BB}" ] && "${CM_BB}" wget --help >/dev/null 2>&1; then
+        CM_WGET="${CM_BB} wget"
+    elif [ -x /system/bin/toybox ] && /system/bin/toybox wget --help >/dev/null 2>&1; then
+        CM_WGET="/system/bin/toybox wget"
+    elif command -v curl >/dev/null 2>&1; then
+        CM_WGET="curl"
+    elif command -v wget >/dev/null 2>&1; then
+        CM_WGET="wget"
+    fi
+
+    # getprop（Android 属性读取）
+    CM_GETPROP=""
+    command -v getprop >/dev/null 2>&1 && CM_GETPROP="getprop"
+    [ -z "${CM_GETPROP}" ] && [ -x /system/bin/getprop ] && CM_GETPROP="/system/bin/getprop"
+
+    # 把模块 bin 放到 PATH 最前（保证 module/bin/{busybox,chroot-mgr} 优先被找到）
+    export PATH="${CM_BINDIR}:/data/adb/ksu/bin:/data/adb/magisk:/system/bin:/system/xbin:/vendor/bin:/sbin:/bin:/usr/bin:/usr/sbin:${PATH}"
+}
+
+cm_require_tools()
+{
+    [ -n "${CM_BB}" ]      || die "未找到 busybox（请将 aarch64 静态 busybox 放到 ${CM_BINDIR}/busybox）"
+    [ -n "${CM_CHROOT}" ]  || die "未找到 chroot（busybox 缺 chroot applet）"
+    if [ -z "${CM_UNSHARE}" ]; then
+        # v0.1.7: 可能是 applet 没找到，也可能是内核不支 unshare(2)（CONFIG_USER_NS 等）
+        # 通过 cm_probe_unshare 探测失败时建议用户看 diagnose 输出来源
+        warn "unshare 不可用：将退化为直接 chroot（容器内 mount 会进入 host namespace，"
+        warn "  exit 后务必 disable 一次以卸载挂载，否则下次 enable 会失败）"
+        warn "  排查: su -c chroot-mgr diagnose → 查 'unshare 实测' 行"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 状态机（D7：文件状态同步；§8.2 统一状态模型）
+#   state ∈ {disabled, enabled, running, starting, stopping, error}
+#   active：处于 running/starting 的 profile（全局至多一个，D21）
+# ---------------------------------------------------------------------------
+cm_state_read()
+{
+    S_VERSION=1; S_STATE=disabled; S_ACTIVE=""; S_PID=""; S_ENGINE=chroot
+    S_ERROR=""; S_UPDATED=0; S_DISTRO=""
+    [ -f "${CM_STATE_FILE}" ] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        case "${k}" in
+            version)    S_VERSION="${v}" ;;
+            state)      S_STATE="${v}" ;;
+            active)     S_ACTIVE="${v}" ;;
+            pid)        S_PID="${v}" ;;
+            engine)     S_ENGINE="${v}" ;;
+            error_msg)  S_ERROR="${v}" ;;
+            updated)    S_UPDATED="${v}" ;;
+            distro)     S_DISTRO="${v}" ;;
+        esac
+    done < "${CM_STATE_FILE}"
+    return 0
+}
+
+# cm_state_write <state> [active] [pid] [error_msg]
+cm_state_write()
+{
+    local newstate active pid errmsg
+    newstate="$(cm_sanitize_line "$1")"
+    active="$(cm_sanitize_line "${2-}")"
+    pid="$(cm_sanitize_line "${3-}")"
+    errmsg="$(cm_sanitize_line "${4-}")"
+    [ -d "${CM_DATA_DIR}" ] || mkdir -p "${CM_DATA_DIR}"
+    local tmp="${CM_STATE_FILE}.tmp.$$"
+    local distro=""
+    [ -n "${active}" ] && distro="$(cm_profile_get "${active}" DISTRO 2>/dev/null)"
+    cat > "${tmp}" <<EOF
+version=1
+updated=$(date +%s)
+state=${newstate}
+engine=chroot
+active=${active}
+pid=${pid}
+distro=${distro}
+error_msg=${errmsg}
+EOF
+    chmod 0644 "${tmp}"
+    mv -f "${tmp}" "${CM_STATE_FILE}"
+    cm_log "state -> ${newstate} active=${active:-none} pid=${pid:-none} ${errmsg:+err=${errmsg}}"
+}
+
+# cm_state_reconcile — 状态文件与实况对账（v0.1.16，状态漂移修复）
+#
+# 根因：state 文件只在操作边界写入（enter 写 running / disable 写 disabled），
+# 会话自行退出（shell exit / PTY 断开 / su 被杀）后无人回写 → state 卡死在
+# running。后续 enable 另一容器即撞 D21 护栏报"已有系统在运行"——正是
+# App 侧"点击启动/停止时提示容器还在运行"的来源。
+#
+# 对账规则（以进程台账 + 兜底扫描 + 挂载实况为准）：
+#   running/starting 且 active 非空：
+#     - rootfs 无挂载            → disabled（崩溃/重启残留，自愈）
+#     - 有挂载但无存活容器进程   → enabled（会话已退出；挂载保留可再 enter）
+#   stopping：无挂载 → disabled（停止序中断残留的收敛）
+#
+# 竞态窗口说明：enter 刚写 running、shell 尚未 attach 的毫秒间隙内 reconcile
+# 可能读到"无进程"而降级 enabled——下一轮 status 轮询（3s）shell 已在，
+# 会翻回 running。状态闪一帧，无实害；换来的是陈旧 running 不再卡死操作。
+#
+# 调用点：cmd_status（App 3s 轮询路径 → UI 永远看到对账后的真实态）、
+#         cmd_enable（D21 判定前 → 不再误报"已有系统在运行"）。
+cm_state_reconcile()
+{
+    cm_state_read
+    case "${S_STATE}" in
+        running|starting)
+            if [ -z "${S_ACTIVE}" ] || ! cm_profile_exists "${S_ACTIVE}"; then
+                cm_state_write disabled "" "" ""
+                return 0
+            fi
+            local rrootfs; rrootfs="$(cm_profile_rootfs "${S_ACTIVE}")"
+            if [ -z "$(cm_mounts_of "${rrootfs}")" ]; then
+                cm_state_write disabled "" "" ""
+            elif [ -z "$(cm_pids_all "${S_ACTIVE}")" ]; then
+                cm_state_write enabled "" "" ""
+            fi
+            ;;
+        stopping)
+            if [ -n "${S_ACTIVE}" ] && cm_profile_exists "${S_ACTIVE}"; then
+                local srootfs; srootfs="$(cm_profile_rootfs "${S_ACTIVE}")"
+                [ -z "$(cm_mounts_of "${srootfs}")" ] && cm_state_write disabled "" "" ""
+            else
+                cm_state_write disabled "" "" ""
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Profile 管理
+# 注意：所有 path 函数内部都 sanitize id，避免调用方忘记 sanitize 导致
+# "原 id 和 sanitize 后 id 形式不同 → 目录找不到" 的 bug。
+# ---------------------------------------------------------------------------
+cm_profile_dir()     { echo "${CM_PROFILES_DIR}/$(cm_sanitize_id "$1")"; }
+cm_profile_rootfs()  { echo "${CM_PROFILES_DIR}/$(cm_sanitize_id "$1")/rootfs"; }
+cm_profile_conf()    { echo "${CM_PROFILES_DIR}/$(cm_sanitize_id "$1")/profile.conf"; }
+cm_profile_pids()    { echo "${CM_PROFILES_DIR}/$(cm_sanitize_id "$1")/.pids"; }
+
+# 容器内非 root 用户配置（首次进入向导 + 标志位）
+# 设计：参考 Linux Deploy Pro core/profile 的 useradd/chpasswd 模式，
+# 但把"配置时机"从"每次 do_configure"改成"首次 enter"——避免重复 useradd 报
+# "user exists' 警告；持久化用 .user_configured（空 marker）+ .user_info（KV），
+# 与现有 .enabled/.pids 同层（profile 根，与具体 rootfs 内容分离）。
+# v0.1.9 新增。
+cm_user_mark()        { echo "${CM_PROFILES_DIR}/$(cm_sanitize_id "$1")/.user_configured"; }
+cm_user_info()        { echo "${CM_PROFILES_DIR}/$(cm_sanitize_id "$1")/.user_info"; }
+
+cm_profile_exists()
+{
+    local id="$(cm_sanitize_id "$1")"
+    [ -f "$(cm_profile_conf "${id}")" ] && [ -d "$(cm_profile_rootfs "${id}")/etc" ]
+}
+
+# cm_profile_get <id> <KEY>  — 从 profile.conf 读单键
+cm_profile_get()
+{
+    local id="$(cm_sanitize_id "$1")" key="$2"
+    local conf; conf="$(cm_profile_conf "${id}")"
+    [ -f "${conf}" ] || return 1
+    sed -n "s/^${key}=\"\{0,1\}\(.*\)/\1/p" "${conf}" 2>/dev/null | sed 's/"$//' | head -1
+}
+
+cm_profile_list()
+{
+    local d id
+    for d in "${CM_PROFILES_DIR}"/*; do
+        [ -d "${d}" ] || continue
+        id="${d##*/}"
+        [ -f "${d}/profile.conf" ] && echo "${id}"
+    done
+}
+
+cm_profile_require()
+{
+    local id="$1"
+    id="$(cm_sanitize_id "${id}")"
+    [ -n "${id}" ] || die "未指定 profile（用法: chroot-mgr <cmd> <profile>）"
+    cm_profile_exists "${id}" || die "profile 不存在或 rootfs 不完整: ${id}
+  提示: chroot-mgr install --import <rootfs.tar.xz> --name <id>"
+}
+
+# 生成 profile.conf
+cm_profile_write_conf()
+{
+    local id="$1" distro="$2" suite="$3" arch="$4" init_class="$5" pkg_family="$6" source_kind="$7"
+    # v0.1.6: 创建收口校验——id 不能以 '-' 开头（option 形状，与 CLI 参数解析冲突）。
+    # 这是 install/import/enable 全部创建路径的兜底闸门。
+    # 历史遗留的 id=--name 坏目录（v0.1.3 产生）不经过这里，删除走 cmd_uninstall 的 --name 通道。
+    case "${id}" in
+        -*)
+            die "非法 profile id（不能以 - 开头）: ${id}
+  提示: id 须以字母或数字开头（如 ubuntu-resolute / alpine-3.22）
+  历史遗留的 '--name' 目录可用: chroot-mgr uninstall --name --name -y 删除"
+            ;;
+    esac
+    # 写入前统一清洗：profile.conf 是"每行一个 KEY=VALUE"，值里带换行就能伪造字段。
+    # distro/suite 来自 rootfs 内 /etc/os-release 的探测结果，属于外部可控输入。
+    # id 必须最先清洗——它同时是目录名，清洗前后不一致会导致目录与 conf 里的 ID 对不上。
+    id="$(cm_sanitize_id "${id}")"
+    distro="$(cm_sanitize_line "${distro}")"
+    suite="$(cm_sanitize_line "${suite}")"
+    arch="$(cm_sanitize_line "${arch}")"
+    init_class="$(cm_sanitize_line "${init_class}")"
+    pkg_family="$(cm_sanitize_line "${pkg_family}")"
+    source_kind="$(cm_sanitize_line "${source_kind}")"
+    local dir; dir="$(cm_profile_dir "${id}")"
+    mkdir -p "${dir}"
+    cat > "${dir}/profile.conf" <<EOF
+# SudoBox profile descriptor
+# 字段语义见 SudoBox-发行版支持设计.md §5（实现为 POSIX sh 可 source 的 KV，
+# 等价于设计稿 YAML 的字段集：id/name/libc/init_class/pkg_family/source/post_unpack）
+ID=${id}
+DISTRO=${distro}
+SUITE=${suite}
+ARCH=${arch}
+INIT_CLASS=${init_class}
+PKG_FAMILY=${pkg_family}
+SOURCE_KIND=${source_kind}
+INCLUDE="${CM_DEFAULT_INCLUDE}"
+MOUNTS=""
+# 进程守护服务清单（v0.1.18，空格分隔）。留空 = auto：
+# A 级发行版且存在 /etc/init.d/sshd 时默认守护 sshd。
+# 示例: GUARD_SERVICES="sshd crond"
+GUARD_SERVICES=""
+CREATED=$(date +%s)
+EOF
+    chmod 0644 "${dir}/profile.conf"
+}
+
+# ---------------------------------------------------------------------------
+# 挂载管理（移植 linuxdeploy include/core/mnt，幂等 + 逆序卸载）
+# ---------------------------------------------------------------------------
+cm_is_mounted()
+{
+    local mp="$1"
+    [ -n "${mp}" ] || return 1
+    grep -q " ${mp%/} " /proc/mounts 2>/dev/null
+}
+
+cm_mount_part()
+{
+    local rootfs="$1" part="$2"
+    local target opts rc=0
+    case "${part}" in
+        proc)
+            target="${rootfs}/proc"
+            [ -d "${target}" ] || mkdir -p "${target}"
+            cm_is_mounted "${target}" || ${CM_MOUNT} -t proc proc "${target}" || rc=1
+            ;;
+        sys)
+            target="${rootfs}/sys"
+            [ -d "${target}" ] || mkdir -p "${target}"
+            cm_is_mounted "${target}" || ${CM_MOUNT} -t sysfs sys "${target}" || rc=1
+            ;;
+        dev)
+            target="${rootfs}/dev"
+            [ -d "${target}" ] || mkdir -p "${target}"
+            cm_is_mounted "${target}" || ${CM_MOUNT} -o bind /dev "${target}" || rc=1
+            ;;
+        devpts)
+            # v0.1.19: 宿主命名空间零副作用——不再 mkdir/挂载全局 /dev/pts。
+            # Android 恒有 /dev/pts（cm_is_mounted 命中走 bind 复用）；异常缺失时
+            # 直接把 devpts 挂到容器内路径（devpts 支持任意空目录挂载点），
+            # 旧版的全局 mount 是纯泄漏（disable 只卸容器路径，全局残留在
+            # 软重启前一直存在）。
+            target="${rootfs}/dev/pts"
+            [ -d "${target}" ] || mkdir -p "${target}"
+            cm_is_mounted "${target}" && return 0
+            if cm_is_mounted /dev/pts; then
+                ${CM_MOUNT} -o bind /dev/pts "${target}" || rc=1
+            else
+                ${CM_MOUNT} -t devpts devpts "${target}" -o rw,nosuid,noexec,mode=620,ptmxmode=000 2>/dev/null || rc=1
+            fi
+            ;;
+        devshm)
+            # v0.1.19: 不再创建/挂载全局 /dev/shm——Android 无此挂载点，旧版会在
+            # 宿主命名空间新建目录并挂 tmpfs（全局副作用，升级/软重启期与系统
+            # 挂载操作互踩的隐患）。tmpfs 可直接挂到容器内目录，语义不变。
+            target="${rootfs}/dev/shm"
+            [ -d "${target}" ] || mkdir -p "${target}"
+            chmod 1777 "${target}" 2>/dev/null
+            cm_is_mounted "${target}" || ${CM_MOUNT} -t tmpfs tmpfs "${target}" -o rw,nosuid,nodev,mode=1777 2>/dev/null || rc=1
+            ;;
+        tmp)
+            target="${rootfs}/tmp"
+            [ -d "${target}" ] || mkdir -p "${target}"
+            chmod 1777 "${target}" 2>/dev/null
+            cm_is_mounted "${target}" || ${CM_MOUNT} -t tmpfs tmpfs "${target}" -o rw,nosuid,nodev,mode=1777 2>/dev/null || rc=1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+    return ${rc}
+}
+
+cm_mount_all()
+{
+    local rootfs="$1" part rc=0
+    [ -d "${rootfs}" ] || die "rootfs 不存在: ${rootfs}"
+
+    # v0.1.15: rootfs 自 bind + remount,exec,suid,dev（linuxdeploy 十年验证机制）
+    # 问题：rootfs 落在 /data（Android 挂载为 nosuid,nodev）→ 容器内一切 setuid
+    #   二进制（sudo/su/passwd）的 setuid 位被内核忽略。chroot 只隔离文件系统
+    #   视图，改变不了宿主挂载标志 → 容器内 sudo 必然失败。
+    # 原理：nosuid 是 per-mount（vfsmount 级）标志而非 superblock 属性——
+    #   把 rootfs bind mount 到自身即得到一个标志独立的新挂载，再 remount 打开
+    #   suid。宿主 /data 的挂载标志纹丝不动；卸载由 cm_umount_all 逆序收敛
+    #   （自 bind 的挂载点排序在所有嵌套挂载之后，天然最后卸，零残留）。
+    #   绝不 remount /data 本身——那是全局操作，注入型临时 root 上有 panic 风险。
+    # 安全边界：suid 生效后容器内用户可提权到容器 root（uid 0），但能力级别与
+    #   'chroot-mgr root' 入口等同（同一 user ns，仅 chroot + mnt ns 约束），
+    #   不引入新的权限级别；不需要时 SUDOBOX_NO_SUID=1 整体关闭。
+    # 失败语义：warn-only 不阻断——bind/remount 失败只影响容器内 sudo/setuid，
+    #   容器本身照常可用（v0.1.14 及之前的既有行为），但必须显式 warn（禁假成功）。
+    if [ "${SUDOBOX_NO_SUID:-0}" != "1" ]; then
+        if ! cm_is_mounted "${rootfs}"; then
+            ${CM_MOUNT} -o bind "${rootfs}" "${rootfs}" 2>/dev/null || \
+                warn "rootfs 自 bind 失败（容器内 sudo/setuid 不可用，容器功能不受影响）"
+        fi
+        ${CM_MOUNT} -o remount,exec,suid,dev "${rootfs}" 2>/dev/null || \
+            warn "rootfs remount suid 失败（容器内 sudo/setuid 不可用，容器功能不受影响）"
+    fi
+
+    for part in proc sys dev devpts devshm tmp; do
+        if ! cm_mount_part "${rootfs}" "${part}"; then
+            warn "挂载 ${part} 失败（继续）"
+            rc=1
+        fi
+    done
+    # 用户自定义 MOUNTS（SRC:DST 空格分隔）
+    local item src dst target
+    for item in ${MOUNTS}; do
+        src="${item%%:*}"; dst="${item##*:}"
+        [ -n "${src}" ] && [ -n "${dst}" ] || continue
+        target="${rootfs}${dst}"
+        [ -d "${target}" ] || mkdir -p "${target}"
+        cm_is_mounted "${target}" && continue
+        if [ -d "${src}" ]; then
+            ${CM_MOUNT} -o bind "${src}" "${target}" || warn "bind ${src} 失败"
+        elif [ -e "${src}" ]; then
+            ${CM_MOUNT} -o rw,relatime "${src}" "${target}" || warn "mount ${src} 失败"
+        fi
+    done
+    return ${rc}
+}
+
+# 逆序卸载 rootfs 下所有挂载点
+cm_umount_all()
+{
+    local rootfs="$1"
+    local i m remaining rc=0
+    for i in 1 2 3; do
+        remaining="$(grep "${rootfs%/}" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r)"
+        [ -n "${remaining}" ] || break
+        for m in ${remaining}; do
+            ${CM_UMOUNT} "${m}" 2>/dev/null || ${CM_UMOUNT} -l "${m}" 2>/dev/null
+        done
+    done
+    # 校验清零
+    remaining="$(grep "${rootfs%/}" /proc/mounts 2>/dev/null | awk '{print $2}')"
+    if [ -n "${remaining}" ]; then
+        warn "仍有挂载未卸载:"
+        for m in ${remaining}; do warn "  ${m}"; done
+        rc=1
+    fi
+    return ${rc}
+}
+
+cm_mounts_of()
+{
+    local rootfs="$1"
+    grep "${rootfs%/}" /proc/mounts 2>/dev/null | awk '{print $2}'
+}
+
+# cm_profile_size <id> — rootfs 磁盘占用（人类可读，如 "1.2G"）。v0.1.25。
+# v0.1.24 实机事故根因：容器运行时 rootfs 内挂着 /proc /sys /dev（见
+# cm_mount_all），无 -x 的 du 会扎进虚拟文件系统（SM8550 的 /sys 达数十万
+# 节点）把 status --json 拖到分钟级；App 3s 轮询叠加成 I/O 风暴 → 120s 超时。
+# 停止态无挂载所以此前从未暴露。修复两件套：
+#   1) du -x：不跨文件系统边界，/proc /sys /dev（不同 st_dev）直接跳过；
+#   2) 300s TTL 缓存：size 仅展示用，轮询路径零成本；安装/导入后最迟 5 分钟刷新。
+cm_profile_size()
+{
+    local id dir cache ts sz now
+    id="$(cm_sanitize_id "$1")"
+    dir="$(cm_profile_dir "${id}")"
+    cache="${dir}/.size.cache"
+    now="$(date +%s)"
+    if [ -f "${cache}" ]; then
+        ts="$(head -n 1 "${cache}" 2>/dev/null)"
+        sz="$(sed -n '2p' "${cache}" 2>/dev/null)"
+        case "${ts}" in
+            ''|*[!0-9]*) ;;
+            *) [ $((now - ts)) -lt 300 ] && { echo "${sz}"; return 0; } ;;
+        esac
+    fi
+    sz="$(du -x -sh "$(cm_profile_rootfs "${id}")" 2>/dev/null | awk '{print $1}')"
+    printf '%s\n%s\n' "${now}" "${sz}" > "${cache}" 2>/dev/null || :
+    echo "${sz}"
+}
+
+# ---------------------------------------------------------------------------
+# 进程台账与定向终止（D22）
+#   - 会话台账：进入时记录 unshare 进程 PID，退出时清理
+#   - 兜底扫描：/proc/*/root 指向该 rootfs 的进程（chroot 内进程特征）
+# ---------------------------------------------------------------------------
+cm_pids_add()
+{
+    local id="$1" pid="$2" f
+    f="$(cm_profile_pids "${id}")"
+    mkdir -p "${CM_PROFILES_DIR}/${id}"
+    grep -v "^${pid}$" "${f}" 2>/dev/null > "${f}.tmp"
+    echo "${pid}" >> "${f}.tmp"
+    mv -f "${f}.tmp" "${f}" 2>/dev/null
+}
+
+cm_pids_del()
+{
+    local id="$1" pid="$2" f
+    f="$(cm_profile_pids "${id}")"
+    [ -f "${f}" ] || return 0
+    grep -v "^${pid}$" "${f}" > "${f}.tmp" 2>/dev/null
+    mv -f "${f}.tmp" "${f}" 2>/dev/null
+}
+
+# 台账中仍存活的 pid
+cm_pids_ledger()
+{
+    local id="$1" f pid out=""
+    f="$(cm_profile_pids "${id}")"
+    [ -f "${f}" ] || return 0
+    while read -r pid; do
+        [ -n "${pid}" ] || continue
+        [ -d "/proc/${pid}" ] && out="${out} ${pid}"
+    done < "${f}"
+    echo "${out}"
+}
+
+# 兜底扫描：/proc/*/root 指向 rootfs 的进程
+cm_pids_scan()
+{
+    local rootfs="$1" p out=""
+    for p in /proc/[0-9]*; do
+        pid="${p##*/}"
+        [ -r "${p}/root" ] || continue
+        # 读 link 目标比 ls -l 更稳（busybox readlink）
+        if [ "$(readlink "${p}/root" 2>/dev/null)" = "${rootfs}" ]; then
+            [ "${pid}" != "$$" ] && out="${out} ${pid}"
+        fi
+    done
+    echo "${out}"
+}
+
+cm_pids_all()
+{
+    local id="$1"
+    local ledger scan pid out=""
+    ledger="$(cm_pids_ledger "${id}")"
+    scan="$(cm_pids_scan "$(cm_profile_rootfs "${id}")")"
+    for pid in ${ledger} ${scan}; do
+        case " ${out} " in
+            *" ${pid} "*) ;;
+            *) out="${out} ${pid}" ;;
+        esac
+    done
+    echo "${out}"
+}
+
+# 定向终止：SIGTERM → 宽限 → SIGKILL → 校验清零
+cm_kill_pids()
+{
+    local pids="$1" pid alive
+    [ -n "${pids}" ] || return 0
+    for pid in ${pids}; do
+        kill -TERM "${pid}" 2>/dev/null
+    done
+    sleep "${CM_TERM_GRACE}"
+    alive=""
+    for pid in ${pids}; do
+        [ -d "/proc/${pid}" ] && alive="${alive} ${pid}"
+    done
+    if [ -n "${alive}" ]; then
+        warn "宽限 ${CM_TERM_GRACE}s 后仍存活，强杀: ${alive}"
+        for pid in ${alive}; do
+            kill -KILL "${pid}" 2>/dev/null
+        done
+        sleep 1
+    fi
+    # 校验清零
+    alive=""
+    for pid in ${pids}; do
+        [ -d "/proc/${pid}" ] && alive="${alive} ${pid}"
+    done
+    [ -z "${alive}" ] || { err "以下进程无法终止: ${alive}"; return 1; }
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 进程守护层（v0.1.18）
+#
+# Android 12+ 的两大进程杀手与本模块的对策：
+#   1) Cached App Freezer：App 进缓存态时，其 uid_xxx cgroup v2 slice 被
+#      整体冻结。容器进程虽经 daemon 化 reparent 到 init，但 **cgroup 归属
+#      随 fork 继承、reparent 不改变**——只要从 App 谱系 fork 出来时不迁移，
+#      sshd 等服务照样随 App 冻结（表现为假死无响应）。
+#      对策：cm_keepalive_migrate 在服务 fork 之前把"根进程"迁出 uid slice
+#      （cgroup/oom_score_adj 都随 fork 继承，迁根 = 迁全树）。
+#   2) 幻影进程杀手（PPK）：杀 App 谱系内存活超时的子进程。daemon 化服务
+#      reparent 到 init 后免疫；交互 shell 会话仍属 App 谱系，但 PPK 只在
+#      App 处于 cached 态时清理 → App 侧前台服务（v0.1.16）保证不进缓存，
+#      两侧协同闭环。
+#
+# 关闭开关：SUDOBOX_NO_KEEPALIVE=1（迁移全部 warn-only，绝不阻断容器启动）。
+# ---------------------------------------------------------------------------
+cm_guard_pidfile()   { echo "${CM_PROFILES_DIR}/$(cm_sanitize_id "$1")/.guard.pid"; }
+cm_guard_heartbeat() { echo "${CM_PROFILES_DIR}/$(cm_sanitize_id "$1")/.guard.beat"; }
+cm_guard_logf()      { echo "${CM_DATA_DIR}/guard.log"; }
+
+cm_pid_alive()
+{
+    [ -n "$1" ] && [ -d "/proc/$1" ]
+}
+
+# 守护服务清单：profile.conf 的 GUARD_SERVICES（空格分隔）优先；
+# 未配置则 auto——A 级发行版且存在 /etc/init.d/sshd 时默认守护 sshd。
+# 用 cm_profile_get 逐键提取而非 source：避免在调用方 shell 里污染
+# DISTRO/INCLUDE 等变量（v0.1.11 教训：变量覆盖必须收口）。
+cm_guard_services()
+{
+    local id rootfs configured svc out=""
+    id="$(cm_sanitize_id "$1")"
+    rootfs="$(cm_profile_rootfs "${id}")"
+    configured="$(cm_profile_get "${id}" GUARD_SERVICES)"
+    if [ -z "${configured}" ]; then
+        # auto：sshd 是最常见的远程入口；init.d 脚本不存在（B 级/未装）则无服务可守护
+        [ -f "${rootfs}/etc/init.d/sshd" ] && configured="sshd"
+    fi
+    for svc in ${configured}; do
+        # 服务名白名单校验：流向 /etc/init.d/ 路径拼接，禁路径分隔符等
+        case "${svc}" in
+            *[!A-Za-z0-9._-]*|*.|.) continue ;;
+        esac
+        [ -f "${rootfs}/etc/init.d/${svc}" ] || continue
+        case " ${out} " in
+            *" ${svc} "*) ;;
+            *) out="${out} ${svc}" ;;
+        esac
+    done
+    # 去掉首累积空格（out 以 " svc" 形式追加）
+    echo "${out# }"
+}
+
+# cm_keepalive_migrate — 迁移当前进程到 cgroup v2 安全区 + oom 托底
+#
+# 调用时机铁律：必须在容器服务/会话 fork 之前。
+# cgroup 归属与 oom_score_adj 都在 fork 时由子进程继承——迁移 enable/enter
+# 的根 shell 一步，之后 fork 出的全部容器进程自动落在安全区。
+# 仅 cgroup v2 生效：Android 12+ freezer 冻结的是 v2 uid slice；
+# v1 层级（cpu/mem 等）无需理会。顶层 root cgroup 是内核文档明确的
+# no-internal-process 例外（可同时容纳进程与子组），AMS 只冻结 uid_xxx。
+cm_keepalive_migrate()
+{
+    [ "${SUDOBOX_NO_KEEPALIVE:-0}" = "1" ] && return 0
+    local cg="/sys/fs/cgroup"
+    [ -f "${cg}/cgroup.controllers" ] || { warn "cgroup v2 未挂载，跳过 keepalive 迁移"; return 0; }
+    local migrated=0
+    # 首选顶层 root cgroup；SELinux 拦截顶层写时降级专建子组
+    if echo $$ > "${cg}/cgroup.procs" 2>/dev/null; then
+        migrated=1
+    else
+        [ -d "${cg}/sudobox" ] || mkdir "${cg}/sudobox" 2>/dev/null
+        if [ -d "${cg}/sudobox" ] && echo $$ > "${cg}/sudobox/cgroup.procs" 2>/dev/null; then
+            migrated=1
+        fi
+    fi
+    if [ "${migrated}" = "1" ]; then
+        cm_log "keepalive: pid $$ migrated -> $(head -1 "/proc/$$/cgroup" 2>/dev/null)"
+    else
+        warn "cgroup 迁移失败（SELinux/权限），容器进程保留原 uid slice（SUDOBOX_NO_KEEPALIVE=1 可静音）"
+    fi
+    # oom_score_adj=-1000：迁移出 AMS 分组视野后 lmkd 按 native 进程处理，此为托底；
+    # 子进程 fork 继承。echo "-1000" 非内建 echo 选项（仅 -n/-e），字面输出安全。
+    if echo "-1000" > "/proc/$$/oom_score_adj" 2>/dev/null; then
+        cm_log "keepalive: pid $$ oom_score_adj=-1000"
+    fi
+    return 0
+}
+
+# 守护循环主体（独立进程运行，经 _guard-loop 隐藏命令进入）
+#
+# 退出条件（三重自检，防孤儿守护）：
+#   a) pidfile 被清除或易主（stop 或新守护接管）→ 退出
+#   b) 容器挂载消失（disable 完成/容器被外力拆除）→ 自清理退出
+#   c) 收到 SIGTERM/SIGINT（cm_guard_stop 定向终止）
+# 服务探活用 /etc/init.d/<svc> status（OpenRC 约定：0=运行中），
+# 崩溃即 restart；巡检走 cm_chroot_exec（幂等挂载，30s 一次开销可忽略）。
+cm_guard_loop()
+{
+    local id="$1"
+    local pidfile beat logf rootfs services svc
+    pidfile="$(cm_guard_pidfile "${id}")"
+    beat="$(cm_guard_heartbeat "${id}")"
+    logf="$(cm_guard_logf)"
+    rootfs="$(cm_profile_rootfs "${id}")"
+    services="$(cm_guard_services "${id}")"
+    [ -n "${services}" ] || exit 0
+
+    # 日志截断：超限砍半（tail -c 保留后半），防长期运行膨胀
+    if [ -f "${logf}" ]; then
+        local sz; sz=$(wc -c < "${logf}" 2>/dev/null)
+        if [ -n "${sz}" ] && [ "${sz}" -gt "${CM_GUARD_LOG_MAX}" ]; then
+            tail -c $((CM_GUARD_LOG_MAX / 2)) "${logf}" > "${logf}.tmp" 2>/dev/null &&
+                mv -f "${logf}.tmp" "${logf}"
+        fi
+    fi
+
+    trap 'rm -f "${pidfile}"; exit 0' TERM INT
+    echo "$$" > "${pidfile}" 2>/dev/null || exit 1
+
+    cm_log "guard: started pid=$$ profile=${id} services=[${services}] interval=${CM_GUARD_INTERVAL}s"
+    echo "[$(date '+%F %T')] started pid=$$ services=[${services}]" >> "${logf}" 2>/dev/null
+    # SUDOBOX_GUARD_MAX_TICKS：有界自退（>0 时巡检 N 轮后自动退出）。
+    # 双重用途：PC 回归测试的有界运行钩子 + 防失控守护的兜底安全网。
+    local ticks=0 max_ticks="${SUDOBOX_GUARD_MAX_TICKS:-0}"
+    while :; do
+        # 可中断睡眠：后台 sleep + wait，TERM 到达立即跑 trap（前台 sleep 要等满间隔）
+        sleep "${CM_GUARD_INTERVAL}" &
+        wait $!
+        # 自检 a：pidfile 易主/被清
+        [ "$(cat "${pidfile}" 2>/dev/null)" = "$$" ] || { rm -f "${pidfile}"; exit 0; }
+        # 自检 b：容器已停
+        if [ -z "$(cm_mounts_of "${rootfs}")" ]; then
+            rm -f "${pidfile}"
+            cm_log "guard: mounts gone, exit pid=$$"
+            exit 0
+        fi
+        for svc in ${services}; do
+            if cm_chroot_exec "${rootfs}" "/etc/init.d/${svc}" status >/dev/null 2>&1; then
+                continue
+            fi
+            cm_log "guard: ${svc} down -> restart"
+            echo "[$(date '+%F %T')] ${svc} down -> restart" >> "${logf}" 2>/dev/null
+            cm_chroot_exec "${rootfs}" "/etc/init.d/${svc}" start >> "${logf}" 2>&1
+        done
+        date +%s > "${beat}" 2>/dev/null
+        if [ "${max_ticks}" -gt 0 ] 2>/dev/null; then
+            ticks=$((ticks + 1))
+            if [ ${ticks} -ge ${max_ticks} ]; then
+                rm -f "${pidfile}"
+                cm_log "guard: max ticks (${max_ticks}) reached, exit pid=$$"
+                exit 0
+            fi
+        fi
+    done
+}
+
+cm_guard_start()
+{
+    local id="$1" pidfile oldpid newpid services
+    id="$(cm_sanitize_id "${id}")"
+    pidfile="$(cm_guard_pidfile "${id}")"
+    oldpid="$(cat "${pidfile}" 2>/dev/null)"
+    if cm_pid_alive "${oldpid}"; then
+        msg "- 守护已在运行 (pid=${oldpid})"
+        return 0
+    fi
+    services="$(cm_guard_services "${id}")"
+    if [ -z "${services}" ]; then
+        msg "- 无可守护服务（B 级发行版或未装 sshd），守护跳过"
+        return 0
+    fi
+    # 双重 fork：子 shell 立即退出 → 守护 reparent 到 init（PID 1），
+    # 脱离 su/App 进程谱系（PPK 免疫）；setsid 脱离会话防 SIGHUP。
+    # v0.1.13 教训适用：stdin 显式 </dev/null（守护本来就不需要 tty）。
+    # 导出数据目录/巡检间隔：守护是独立进程，脚本顶部常量会在子进程里
+    # 重新初始化，不导出则子进程落回默认路径（PC 测试重定向会失效）。
+    SUDOBOX_DATA_DIR="${CM_DATA_DIR}"
+    SUDOBOX_GUARD_INTERVAL="${CM_GUARD_INTERVAL}"
+    export SUDOBOX_DATA_DIR SUDOBOX_GUARD_INTERVAL
+    if command -v setsid >/dev/null 2>&1; then
+        ( setsid "${CM_BINDIR}/chroot-mgr" _guard-loop "${id}" </dev/null >/dev/null 2>&1 & )
+    else
+        ( "${CM_BINDIR}/chroot-mgr" _guard-loop "${id}" </dev/null >/dev/null 2>&1 & )
+    fi
+    sleep 1
+    newpid="$(cat "${pidfile}" 2>/dev/null)"
+    if cm_pid_alive "${newpid}"; then
+        msg "- 进程守护已启动 (pid=${newpid}, services=[${services}])"
+        return 0
+    fi
+    warn "进程守护启动失败（详见 ${CM_LOG_FILE}）"
+    return 1
+}
+
+cm_guard_stop()
+{
+    local id="$1" pidfile pid i
+    id="$(cm_sanitize_id "${id}")"
+    pidfile="$(cm_guard_pidfile "${id}")"
+    pid="$(cat "${pidfile}" 2>/dev/null)"
+    if ! cm_pid_alive "${pid}"; then
+        rm -f "${pidfile}" "$(cm_guard_heartbeat "${id}")"
+        return 0
+    fi
+    kill -TERM "${pid}" 2>/dev/null
+    i=0
+    while [ ${i} -lt 5 ]; do
+        cm_pid_alive "${pid}" || break
+        sleep 1
+        i=$((i + 1))
+    done
+    cm_pid_alive "${pid}" && kill -KILL "${pid}" 2>/dev/null
+    rm -f "${pidfile}"
+    cm_log "guard: stopped (pid=${pid})"
+    return 0
+}
+
+cm_guard_status()
+{
+    local id="$1" pid beat services
+    id="$(cm_sanitize_id "${id}")"
+    pid="$(cat "$(cm_guard_pidfile "${id}")" 2>/dev/null)"
+    if ! cm_pid_alive "${pid}"; then
+        echo "guard: inactive"
+        return 0
+    fi
+    services="$(cm_guard_services "${id}")"
+    local beat_age="-"
+    beat="$(cat "$(cm_guard_heartbeat "${id}")" 2>/dev/null)"
+    [ -n "${beat}" ] && beat_age="$(( $(date +%s) - beat ))s"
+    echo "guard: running pid=${pid} services=[${services}] last_beat=${beat_age}"
+    return 0
+}
+
+# cmd_guard start|stop|status [profile] — 手动控制入口（默认作用于 active）
+cmd_guard()
+{
+    local action="$1" id="$2"
+    cm_detect_tools
+    cm_state_read
+    [ -n "${id}" ] || id="${S_ACTIVE}"
+    [ -n "${id}" ] || id="$(cm_profile_list | head -1)"
+    cm_profile_require "${id}"
+    case "${action}" in
+        start)  cm_guard_start "${id}" ;;
+        stop)   cm_guard_stop "${id}" ;;
+        status) cm_guard_status "${id}" ;;
+        *)      die "用法: chroot-mgr guard start|stop|status [profile]" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 全局监督 daemon（v0.1.24）——DroidSpaces daemon-mode 的 SudoBox 对应物
+#
+# 与 per-container guard 的分工：
+#   guard  = 容器内服务 watchdog（sshd 崩溃拉起），随单容器生灭
+#   daemon = 跨容器监督层：状态对账 tick / boot-restore 执行者 / 事件日志 /
+#            （预留）net ns 路由监视器挂点
+# 生命周期铁律（用户约束 2026-09-08：容器结束不留常驻）：
+#   a) enable 首容器时幂等拉起（quiet，不喧哗）
+#   b) 最后一个容器 disable/uninstall 后**立即**显式终止（disable 收尾检查）
+#   c) 空转 CM_DAEMON_IDLE_TICKS 轮自杀 + SUDOBOX_DAEMON_MAX_TICKS 有界自退双兜底
+#   d) 软重启/临时 root 丢失 → 进程自然消亡，下次 enable 对账自愈
+# 不改系统红线：纯 shell 循环进程，setsid 脱谱系；不写 /system、无 init.rc、
+# 不进 vendor；cgroup/oom 策略继承 guard 的 cm_keepalive_migrate 结果（daemon
+# 由 enable 派生，已在安全 cgroup 内）。
+# ---------------------------------------------------------------------------
+cm_daemon_pidfile() { echo "${CM_DATA_DIR}/.daemon.pid"; }
+cm_daemon_beat()    { echo "${CM_DATA_DIR}/.daemon.beat"; }
+cm_daemon_logf()    { echo "${CM_DATA_DIR}/daemon.log"; }
+
+# 统计"挂载仍存活"的容器数（与 cm_state_reconcile 同口径：有挂载=活）
+cm_daemon_active_count()
+{
+    local id n=0 rootfs
+    for id in $(cm_profile_list); do
+        rootfs="$(cm_profile_rootfs "${id}")"
+        [ -n "$(cm_mounts_of "${rootfs}")" ] && n=$((n + 1))
+    done
+    echo "${n}"
+}
+
+# 全局监督循环（独立进程，经 _daemon-loop 隐藏命令进入；$1=boot_restore 0/1）
+# 退出条件：pidfile 易主/被清 / 空转自杀 / SIGTERM / MAX_TICKS
+cm_daemon_loop()
+{
+    local boot_restore="${1:-0}" pidfile beat logf logsz
+    pidfile="$(cm_daemon_pidfile)"
+    beat="$(cm_daemon_beat)"
+    logf="$(cm_daemon_logf)"
+
+    # 日志截断：超限砍半（同 guard 策略，复用 CM_GUARD_LOG_MAX 阈值）
+    if [ -f "${logf}" ]; then
+        logsz=$(wc -c < "${logf}" 2>/dev/null)
+        if [ -n "${logsz}" ] && [ "${logsz}" -gt "${CM_GUARD_LOG_MAX}" ]; then
+            tail -c $((CM_GUARD_LOG_MAX / 2)) "${logf}" > "${logf}.tmp" 2>/dev/null &&
+                mv -f "${logf}.tmp" "${logf}"
+        fi
+    fi
+
+    trap 'rm -f "${pidfile}" "${beat}"; exit 0' TERM INT
+    echo "$$" > "${pidfile}" 2>/dev/null || exit 1
+
+    cm_log "daemon: started pid=$$ interval=${CM_DAEMON_INTERVAL}s boot_restore=${boot_restore}"
+    echo "[$(date '+%F %T')] daemon started pid=$$ boot_restore=${boot_restore}" >> "${logf}" 2>/dev/null
+
+    # boot-restore（--boot）：开机恢复职责从 service.sh 的一次性循环移交本进程，
+    # 之后的开机对账/状态维护统一在 daemon tick 里做
+    if [ "${boot_restore}" = "1" ]; then
+        local bid
+        for bid in $(cm_profile_list); do
+            [ -f "$(cm_profile_dir "${bid}")/.enabled" ] || continue
+            echo "[$(date '+%F %T')] boot-restore: enable ${bid}" >> "${logf}" 2>/dev/null
+            # 子壳隔离：cmd_enable 内部 die（busybox 缺失/挂载失败等）只会终结
+            # 该次恢复，不得带走 daemon 循环——后续 profile 与对账 tick 要继续
+            ( cmd_enable "${bid}" >> "${logf}" 2>&1 )
+            echo "[$(date '+%F %T')] boot-restore enable ${bid} rc=$?" >> "${logf}" 2>/dev/null
+        done
+    fi
+
+    local ticks=0 idle=0 max_ticks="${SUDOBOX_DAEMON_MAX_TICKS:-0}"
+    local st_before st_after
+    while :; do
+        # 可中断睡眠：后台 sleep + wait，TERM 到达立即跑 trap
+        sleep "${CM_DAEMON_INTERVAL}" &
+        wait $!
+        # 自检 a：pidfile 被清/易主（stop 或新守护接管）
+        [ "$(cat "${pidfile}" 2>/dev/null)" = "$$" ] || { rm -f "${pidfile}" "${beat}"; exit 0; }
+
+        # 对账 tick：状态漂移自愈（陈旧 running → enabled/disabled），漂移记事件
+        cm_state_read
+        st_before="${S_STATE}"
+        cm_state_reconcile
+        cm_state_read
+        st_after="${S_STATE}"
+        if [ "${st_before}" != "${st_after}" ]; then
+            echo "[$(date '+%F %T')] reconcile: ${st_before} -> ${st_after}" >> "${logf}" 2>/dev/null
+        fi
+
+        # 自检 b：无任何存活容器 → 空转计数；连续 N 轮即自杀
+        #（disable 成功路径会显式提前杀，这里是外力卸载/异常消失的兜底）
+        if [ "$(cm_daemon_active_count)" = "0" ]; then
+            idle=$((idle + 1))
+            if [ ${idle} -ge ${CM_DAEMON_IDLE_TICKS} ]; then
+                rm -f "${pidfile}" "${beat}"
+                cm_log "daemon: no active container, idle exit pid=$$"
+                echo "[$(date '+%F %T')] daemon idle exit pid=$$" >> "${logf}" 2>/dev/null
+                exit 0
+            fi
+        else
+            idle=0
+        fi
+
+        date +%s > "${beat}" 2>/dev/null
+
+        if [ "${max_ticks}" -gt 0 ] 2>/dev/null; then
+            ticks=$((ticks + 1))
+            if [ ${ticks} -ge ${max_ticks} ]; then
+                rm -f "${pidfile}" "${beat}"
+                cm_log "daemon: max ticks (${max_ticks}) reached, exit pid=$$"
+                exit 0
+            fi
+        fi
+    done
+}
+
+cm_daemon_start()
+{
+    local quiet="${1:-0}" boot_restore="${2:-0}" pidfile oldpid newpid
+    pidfile="$(cm_daemon_pidfile)"
+    oldpid="$(cat "${pidfile}" 2>/dev/null)"
+    if cm_pid_alive "${oldpid}"; then
+        [ "${quiet}" = "1" ] || msg "- 全局守护已在运行 (pid=${oldpid})"
+        return 0
+    fi
+    # 双重 fork + setsid 脱谱系（同 guard；v0.1.13 教训：stdin 显式 </dev/null）。
+    # 环境变量传递：daemon 子进程脚本顶部会重置 CM_*，重定向必须走 env 导出。
+    SUDOBOX_DATA_DIR="${CM_DATA_DIR}"
+    SUDOBOX_DAEMON_INTERVAL="${CM_DAEMON_INTERVAL}"
+    SUDOBOX_DAEMON_IDLE_TICKS="${CM_DAEMON_IDLE_TICKS}"
+    export SUDOBOX_DATA_DIR SUDOBOX_DAEMON_INTERVAL SUDOBOX_DAEMON_IDLE_TICKS
+    if command -v setsid >/dev/null 2>&1; then
+        ( setsid "${CM_BINDIR}/chroot-mgr" _daemon-loop "${boot_restore}" </dev/null >/dev/null 2>&1 & )
+    else
+        ( "${CM_BINDIR}/chroot-mgr" _daemon-loop "${boot_restore}" </dev/null >/dev/null 2>&1 & )
+    fi
+    sleep 1
+    newpid="$(cat "${pidfile}" 2>/dev/null)"
+    if cm_pid_alive "${newpid}"; then
+        [ "${quiet}" = "1" ] || msg "- 全局守护已启动 (pid=${newpid})"
+        return 0
+    fi
+    [ "${quiet}" = "1" ] || warn "全局守护启动失败（详见 ${CM_LOG_FILE}）"
+    return 1
+}
+
+cm_daemon_stop()
+{
+    local pidfile pid i
+    pidfile="$(cm_daemon_pidfile)"
+    pid="$(cat "${pidfile}" 2>/dev/null)"
+    if ! cm_pid_alive "${pid}"; then
+        rm -f "${pidfile}" "$(cm_daemon_beat)"
+        return 0
+    fi
+    kill -TERM "${pid}" 2>/dev/null
+    i=0
+    while [ ${i} -lt 5 ]; do
+        cm_pid_alive "${pid}" || break
+        sleep 1
+        i=$((i + 1))
+    done
+    cm_pid_alive "${pid}" && kill -KILL "${pid}" 2>/dev/null
+    rm -f "${pidfile}" "$(cm_daemon_beat)"
+    cm_log "daemon: stopped (pid=${pid})"
+    return 0
+}
+
+cm_daemon_status()
+{
+    local pid beat beat_age="-"
+    pid="$(cat "$(cm_daemon_pidfile)" 2>/dev/null)"
+    if ! cm_pid_alive "${pid}"; then
+        echo "daemon: inactive"
+        return 0
+    fi
+    beat="$(cat "$(cm_daemon_beat)" 2>/dev/null)"
+    [ -n "${beat}" ] && beat_age="$(( $(date +%s) - beat ))s"
+    echo "daemon: running pid=${pid} active=$(cm_daemon_active_count) last_beat=${beat_age}"
+    return 0
+}
+
+# cmd_daemon start [--boot]|stop|status — 全局监督守护手动入口
+cmd_daemon()
+{
+    local action="$1" boot=0
+    cm_detect_tools
+    case "${action}" in
+        start)
+            [ "${2:-}" = "--boot" ] && boot=1
+            cm_daemon_start 0 "${boot}"
+            ;;
+        stop)   cm_daemon_stop ;;
+        status) cm_daemon_status ;;
+        *)      die "用法: chroot-mgr daemon start [--boot]|stop|status" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 容器内执行（引擎核心：unshare -m + chroot）
+# ---------------------------------------------------------------------------
+# cm_chroot_exec <rootfs> [cmd...]  — 单次执行（非交互）
+cm_chroot_exec()
+{
+    local rootfs="$1"; shift
+    cm_mount_all "${rootfs}" >/dev/null 2>&1
+    unset TMP TEMP TMPDIR LD_PRELOAD LD_DEBUG
+    local cpath="${PATH}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    if [ $# -gt 0 ]; then
+        PATH="${cpath}" ${CM_CHROOT} "${rootfs}" "$@"
+    else
+        PATH="${cpath}" ${CM_CHROOT} "${rootfs}" /bin/sh -c 'exec /bin/bash -l 2>/dev/null || exec /bin/sh -l'
+    fi
+}
+
+# cm_enter_session <id> [cmd...] — 带台账的交互式进入
+cm_enter_session()
+{
+    local id="$1"; shift
+    local rootfs; rootfs="$(cm_profile_rootfs "${id}")"
+    local helper="${CM_BINDIR}/chroot-enter.sh"
+    [ -x "${helper}" ] || die "缺少 ${helper}"
+
+    cm_mount_all "${rootfs}" || die "挂载失败"
+
+    # keepalive 迁移（v0.1.18）：交互会话树同享安全 cgroup + oom 托底。
+    # 会话本身仍属 App 谱系（PPK 由 App 前台服务兜住），但迁移让会话内
+    # fork 的服务/后台任务不随 App 缓存被冻结。
+    cm_keepalive_migrate
+
+    # 记录 state=running 与会话台账
+    cm_state_write running "${id}" "$$" ""
+
+    # v0.1.9: 导出 SUDOBOX_USER_NAME 给 chroot-enter.sh，让它知道该落到哪个非 root
+    # 用户（cm_user_setup_if_needed 已创建）。来源是 .user_info（profile 根目录，
+    # 不在 rootfs 内——容器删了也不影响标记）。
+    SUDOBOX_USER_NAME=""
+    # v0.1.14: root 专用入口（chroot-mgr root）→ SUDOBOX_FORCE_ROOT=1，
+    # 不读 .user_info、SUDOBOX_USER_NAME 置空 → chroot-enter.sh 走 root fallback
+    # （bash -l 直落，不经 setpriv/su/PAM），任何容器都能拿到 root shell。
+    if [ "${SUDOBOX_FORCE_ROOT:-0}" = "1" ]; then
+        SUDOBOX_USER_NAME=""
+    elif [ -f "$(cm_user_info "${id}")" ]; then
+        . "$(cm_user_info "${id}")" 2>/dev/null
+        SUDOBOX_USER_NAME="${USER_NAME:-}"
+    fi
+    export SUDOBOX_USER_NAME
+
+    local rc=0
+    if [ -n "${CM_UNSHARE}" ]; then
+        # v0.1.8: ${CM_UNSHARE} 不能加引号——CM_UNSHARE 是"多词命令"字符串
+        # （形如 "/path/to/busybox unshare"），加双引号会阻止 word splitting，
+        # 整个带空格字符串被当作 argv[0] 传给 execve → "inaccessible or not found"
+        # exit 127（v0.1.7 实测根因）。约定：CM_UNSHARE/CM_CHROOT/CM_BB 等
+        # 多词命令变量一律不引号展开，由 shell 拆词。
+        #
+        # v0.1.13: 后台任务必须显式 </dev/tty —— 实机根因（adb -tt 复现确认）：
+        #   mksh/POSIX 对非交互 shell 的异步列表（cmd &）默认把 stdin 重定向到
+        #   /dev/null → helper 及 exec 链末端的 bash -l 检测到 stdin 非 tty →
+        #   非交互模式 → 读 EOF 静默秒退（v0.1.9~0.1.12 "配置成功但入口死亡"）。
+        #   注意显式 <&0 救不了：mksh 先替换 fd0 再处理显式重定向，<&0 复制的
+        #   已是 /dev/null。/dev/tty = 会话控制终端（App PTY / adb -tt 均可用），
+        #   先用一次性子 shell 预检（失败只伤子 shell），可开才用，否则退回旧行为。
+        local _tty=""
+        if ( exec 0</dev/tty ) 2>/dev/null; then
+            _tty="/dev/tty"
+        fi
+        if [ -n "${_tty}" ]; then
+            ${CM_UNSHARE} -m "${helper}" "${rootfs}" "$@" <"${_tty}" &
+        else
+            # 无控制终端（无头调用）：stdin=/dev/null，容器内为非交互 shell
+            ${CM_UNSHARE} -m "${helper}" "${rootfs}" "$@" &
+        fi
+        local child=$!
+        cm_pids_add "${id}" "${child}"
+        cm_state_write running "${id}" "${child}" ""
+        wait "${child}"
+        rc=$?
+        cm_pids_del "${id}" "${child}"
+    else
+        # v0.1.7: 进入路径醒目 warn——告诉用户"为什么没走 unshare"
+        msg "== 进入模式: 直接 chroot (无 namespace 隔离) =="
+        msg "  原因: unshare 探测失败（详见 chroot-mgr diagnose）"
+        msg "  行为: 容器内 mount 进入 host namespace，exit 后必须 disable 卸载挂载"
+        "${helper}" "${rootfs}" "$@"
+        rc=$?
+    fi
+    unset SUDOBOX_USER_NAME
+
+    # 退出后收敛状态：若该 profile 无其它 chroot 进程 → 回落 enabled
+    local left
+    left="$(cm_pids_all "${id}")"
+    if [ -n "${left}" ]; then
+        cm_state_write running "${id}" "${left##* }" ""
+    else
+        cm_state_write enabled "" "" ""
+    fi
+    return ${rc}
+}
+
+# ---------------------------------------------------------------------------
+# 首次进入：容器内非 root 用户配置（v0.1.9 新增）
+# 设计依据：参考 Linux Deploy Pro core/profile 的 useradd/chpasswd 模式，
+# 把"每次 do_configure 重建用户"改成"首次 enter 一次性配置 + 标志位持久化"。
+#
+# 行为契约：
+#   * .user_configured 存在          → 幂等跳过（避免 useradd 反复报 user exists）
+#   * 标志位缺失 + stdin 是 TTY      → 交互 prompt（用户名/UID/密码，含默认值）
+#   * 标志位缺失 + stdin 非 TTY      → 静默用默认值（App 启动 / 批处理场景）
+#   * 用户名校验：拒绝 root / aid_*（Linux Deploy Pro 兼容）/ 空 / 非 [a-zA-Z0-9_]
+#   * UID 范围 [1000, 60000]；超出时仍按用户输入（warn）
+#   * 密码默认 android（用户名同名，方便记忆）；密码**不落盘**
+#   * 紧急入口：root 密码清空（chpasswd + passwd -d 双兜底），保证 chroot 内可
+#     'su - root' 直接回 root 不需要密码（pd2338 + KSU 临时 root 的安全要求）
+#
+# 持久化：
+#   ${CM_PROFILES_DIR}/<id>/.user_configured  空 marker（与 .enabled/.pids 同层）
+#   ${CM_PROFILES_DIR}/<id>/.user_info        KEY=VALUE 文本，权限 0600
+#                                              字段：USER_NAME, USER_UID
+# ---------------------------------------------------------------------------
+cm_user_setup_if_needed()
+{
+    local id="$1"
+    local mark; mark="$(cm_user_mark "${id}")"
+    local info; info="$(cm_user_info "${id}")"
+    local rootfs; rootfs="$(cm_profile_rootfs "${id}")"
+
+    # 已配置 → 幂等跳过。
+    # v0.1.10 自愈：marker 存在但容器内用户缺失（v0.1.9 吞错导致"假成功"遗留的
+    # 坏状态：marker 已写、/etc/passwd 无对应用户、su 报 does not exist）→
+    # 视为未配置，清除标志重走配置流程。用户刷完新包直接 enter 即可修复。
+    # v0.1.11 自愈扩展：用户存在但 shell 不可登录（rootfs 预置同名账户遗留，
+    # 如 android shell=/bin/false）→ 同样重走配置修复（容器内脚本 v0.1.11 起
+    # 幂等，重跑安全：校正 shell/home/属主 + 重设密码）。
+    if [ -f "${mark}" ]; then
+        local _uname="" _ush=""
+        if [ -f "${info}" ]; then
+            # 子 shell 内 source，避免 USER_NAME/USER_UID 污染当前进程全局
+            _uname="$( . "${info}" 2>/dev/null; printf '%s' "${USER_NAME:-}" )"
+        fi
+        if [ -z "${_uname}" ] || [ ! -f "${rootfs}/etc/passwd" ] \
+           || ! grep -q "^${_uname}:" "${rootfs}/etc/passwd" 2>/dev/null; then
+            warn "配置标志存在但容器内用户 '${_uname:-?}' 缺失（假成功遗留），重走配置"
+            rm -f "${mark}" "${info}"
+        else
+            _ush="$(grep "^${_uname}:" "${rootfs}/etc/passwd" 2>/dev/null | head -n1 | cut -d: -f7)"
+            case "${_ush}" in
+                /bin/false|/usr/sbin/nologin|/sbin/nologin|/bin/sync)
+                    warn "用户 '${_uname}' 的 shell 为 ${_ush}（不可登录，预置账户遗留），重走配置修复"
+                    rm -f "${mark}" "${info}" ;;
+                "")
+                    warn "用户 '${_uname}' 的 passwd 条目缺 shell 字段，重走配置修复"
+                    rm -f "${mark}" "${info}" ;;
+                *)
+                    if [ -x "${rootfs}${_ush}" ]; then
+                        return 0
+                    fi
+                    warn "用户 '${_uname}' 的 shell ${_ush} 在容器内不存在，重走配置修复"
+                    rm -f "${mark}" "${info}" ;;
+            esac
+        fi
+    fi
+
+    [ -d "${rootfs}/bin" ] || [ -d "${rootfs}/usr/bin" ] || {
+        warn "rootfs 异常无 /bin: ${rootfs}，跳过用户配置"
+        return 0
+    }
+
+    local default_name="android"
+    local default_uid="1000"
+    local default_pw="android"
+
+    local user_name="" user_uid="" user_pw=""
+    if [ -t 0 ]; then
+        msg ""
+        msg "== 首次进入容器: ${id} =="
+        msg "  SudoBox 将在容器内创建一个非 root 用户"
+        msg "  （参考 Linux Deploy Pro 设计；按 Enter 取默认值）"
+        msg ""
+        printf "  用户名 [${default_name}]: "
+        read -r ans
+        user_name="${ans:-${default_name}}"
+        printf "  UID    [${default_uid}]: "
+        read -r ans
+        user_uid="${ans:-${default_uid}}"
+        printf "  密码   [${default_pw}]: "
+        # v0.1.10: read -rs 的 -s 在 mksh（#!/system/bin/sh）下语义是"存历史"
+        # 而非"静默"，实机截图复现密码明文回显。改用模块自带 busybox stty
+        # 关/恢复回显（跨 shell 可靠；toybox stty 也可用但 CM_BB 必在）。
+        [ -n "${CM_BB:-}" ] && ${CM_BB} stty -echo 2>/dev/null
+        read -r ans
+        [ -n "${CM_BB:-}" ] && ${CM_BB} stty echo 2>/dev/null
+        user_pw="${ans:-${default_pw}}"
+        printf "\n"
+    else
+        msg "  :: 首次进入 ${id}：静默创建 ${default_name}/uid=${default_uid} (非交互)"
+        user_name="${default_name}"
+        user_uid="${default_uid}"
+        user_pw="${default_pw}"
+    fi
+
+    # 校验
+    case "${user_name}" in
+        ""|root|aid_*)
+            err "非法用户名: '${user_name}'（不允许 root / aid_* / 空）"
+            return 1
+            ;;
+    esac
+    case "${user_name}" in
+        *[!a-zA-Z0-9_]*)
+            err "用户名只能含 [a-zA-Z0-9_]: '${user_name}'"
+            return 1
+            ;;
+    esac
+    case "${user_uid}" in
+        ""|*[!0-9]*)
+            err "UID 必须是数字: '${user_uid}'"
+            return 1
+            ;;
+    esac
+    if [ "${user_uid}" -lt 1000 ] || [ "${user_uid}" -gt 60000 ] 2>/dev/null; then
+        warn "UID ${user_uid} 不在常规用户范围 [1000,60000]，仍按用户输入"
+    fi
+
+    msg "  -> 创建用户 ${user_name} (uid=${user_uid}) ..."
+
+    # 容器内执行（mount 由 cm_chroot_exec 处理；user_name 已 sanitize 为
+    # [a-zA-Z0-9_]+，user_uid 为纯数字，user_pw 任意但作为 env 字符串传递
+    # 不会被 shell 解释——避免 here-doc 内 user_name 包含元字符的安全/转义陷阱）
+    #
+    # v0.1.10 重写：v0.1.9 版本每步 2>/dev/null + 无条件 exit 0，useradd 失败被
+    # 伪装成成功（实机截图：只输出 root 清密码的 "passwd: password changed."），
+    # 宿主侧又无条件写 marker → "已配置"假象 + 用户锁死。教训：禁用无声吞错。
+    # v0.1.11 幂等重写：rootfs 可能预置同名系统账户（实机：Ubuntu rootfs 自带
+    # android uid=1000 shell=/bin/false）→ v0.1.10 对 "useradd: already exists"
+    # 只会置 _rc=1 永远无法收敛（重试死循环）。现约定：已存在且 uid 一致 →
+    # 校正 shell/home/属主后继续（幂等）；uid 冲突 → 明确报错不自动改。
+    USER_NAME_VAL="${user_name}" \
+    USER_UID_VAL="${user_uid}" \
+    USER_PW_VAL="${user_pw}" \
+    cm_chroot_exec "${rootfs}" /bin/sh -c '
+_rc=0
+_user_sh="/bin/bash"
+[ -x "/bin/bash" ] || _user_sh="/bin/sh"
+_home="/home/${USER_NAME_VAL}"
+
+# 1) 组（幂等）：已存在跳过；否则按发行版工具创建（shadow groupadd / busybox addgroup）
+if grep -q "^${USER_NAME_VAL}:" /etc/group 2>/dev/null; then
+    :
+elif command -v groupadd >/dev/null 2>&1; then
+    groupadd -f -g "${USER_UID_VAL}" "${USER_NAME_VAL}" 2>&1 || {
+        echo "W: groupadd -g ${USER_UID_VAL} 失败，改用自动 gid"
+        groupadd -f "${USER_NAME_VAL}" 2>&1 || { echo "E: groupadd ${USER_NAME_VAL} 彻底失败"; _rc=1; }
+    }
+elif command -v addgroup >/dev/null 2>&1; then
+    addgroup -g "${USER_UID_VAL}" "${USER_NAME_VAL}" 2>/dev/null || \
+        addgroup "${USER_NAME_VAL}" 2>&1 || { echo "E: addgroup ${USER_NAME_VAL} 彻底失败"; _rc=1; }
+else
+    echo "W: 容器内无 groupadd/addgroup，跳过建组（useradd 可能自行建组）"
+fi
+
+# 2) 用户（幂等）：已存在且 uid 一致 → 校正 shell/home 继续；uid 冲突 → 报错；
+#    不存在 → 正常创建。stderr 全程不吞（v0.1.9 事故根因）。
+if grep -q "^${USER_NAME_VAL}:" /etc/passwd 2>/dev/null; then
+    _cur_uid="$(grep "^${USER_NAME_VAL}:" /etc/passwd | head -n1 | cut -d: -f3)"
+    if [ "${_cur_uid}" = "${USER_UID_VAL}" ]; then
+        echo "I: 用户 ${USER_NAME_VAL} 已存在 (uid=${_cur_uid})——校正 shell/home 后继续"
+        if command -v usermod >/dev/null 2>&1; then
+            usermod -s "${_user_sh}" "${USER_NAME_VAL}" 2>&1 || echo "W: usermod -s 失败"
+        else
+            # busybox 系无 usermod：直接改 /etc/passwd 第 7 字段
+            sed -i "s|^\\(${USER_NAME_VAL}:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:\\).*|\\1${_user_sh}|" /etc/passwd
+        fi
+        if [ -d "${_home}" ]; then
+            # 预置账户的 home 可能属 root，递归修正（递归失败降级仅顶层）
+            chown -R "${USER_NAME_VAL}:${USER_NAME_VAL}" "${_home}" 2>/dev/null ||
+                chown "${USER_NAME_VAL}:${USER_NAME_VAL}" "${_home}" 2>/dev/null ||
+                echo "W: ${_home} 属主修正失败（可能影响登录）"
+        else
+            mkdir -p "${_home}" 2>&1 &&
+                chown "${USER_NAME_VAL}:${USER_NAME_VAL}" "${_home}" 2>&1 ||
+                echo "W: ${_home} 创建/属主失败"
+        fi
+    else
+        echo "E: 用户 ${USER_NAME_VAL} 已存在但 uid=${_cur_uid} ≠ ${USER_UID_VAL}（uid 冲突，不自动改）"
+        echo "   处理: enter 时改用其它用户名；或在容器内（root）手动调整后 user-config --reset 重配"
+        _rc=1
+    fi
+else
+    if command -v useradd >/dev/null 2>&1; then
+        useradd -m -u "${USER_UID_VAL}" -g "${USER_NAME_VAL}" -s "${_user_sh}" "${USER_NAME_VAL}" 2>&1 || { echo "E: useradd 失败"; _rc=1; }
+    else
+        # Alpine/busybox rootfs：adduser（busybox 语法；Ubuntu 的 perl adduser 不认 -D/-G）
+        adduser -D -u "${USER_UID_VAL}" -G "${USER_NAME_VAL}" -s "${_user_sh}" "${USER_NAME_VAL}" 2>&1 || { echo "E: adduser 失败"; _rc=1; }
+    fi
+fi
+
+# 3) 密码（无条件重设——同时解锁预置账户 shadow 里的锁定位）
+printf "%s:%s\n" "${USER_NAME_VAL}" "${USER_PW_VAL}" | chpasswd 2>&1 || { echo "E: chpasswd ${USER_NAME_VAL} 失败"; _rc=1; }
+
+# 4) 自检：/etc/passwd 必须有 name:*:uid: 条目（su 的 getpwnam 读的就是这份文件）
+grep -q "^${USER_NAME_VAL}:[^:]*:${USER_UID_VAL}:" /etc/passwd || {
+    echo "E: 自检失败：/etc/passwd 无 ${USER_NAME_VAL}:${USER_UID_VAL} 条目"
+    _rc=1
+}
+
+# 5) root 紧急入口：清空密码。passwd -d 是正主（直接删 hash 字段）；
+#    chpasswd 传空密码会被 shadow 版拒绝（实机 W 噪音来源），仅作 busybox 兜底
+passwd -d root >/dev/null 2>&1 || { printf "root:\n" | chpasswd >/dev/null 2>&1 || echo "W: root 密码清空失败（不影响 setpriv 直降权进入，仅影响旧式 su - root）"; }
+exit ${_rc}
+'
+
+    # rc 检查：失败不写 marker，下次 enter 重试（v0.1.10 核心：假成功禁令）
+    local _setup_rc=$?
+    if [ "${_setup_rc}" -ne 0 ]; then
+        err "用户 ${user_name} 创建失败 (rc=${_setup_rc})，见上方错误输出。"
+        err "未写配置标志——修复问题后重新 enter 即可重试配置。"
+        return 1
+    fi
+
+    # 持久化（仅在容器内自检通过后落盘）
+    cat > "${info}" <<EOF
+USER_NAME=${user_name}
+USER_UID=${user_uid}
+EOF
+    chmod 0600 "${info}" 2>/dev/null
+    : > "${mark}"
+
+    msg "  ✓ 完成：用户 ${user_name} 已配置。下次直接进：chroot-mgr enter ${id}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 组件系统（移植 linuxdeploy include/：deploy.conf + do_* 六函数）
+# ---------------------------------------------------------------------------
+cm_component_exec()
+{
+    local action="$1"; shift
+    local components="$*"
+    [ -n "${components}" ] || components="${INCLUDE:-${CM_DEFAULT_INCLUDE}}"
+    local comp dir rc=0
+
+    for comp in ${components}; do
+        dir="${CM_INCLUDE_DIR}/${comp}"
+        [ -d "${dir}" ] || { warn "组件不存在: ${comp}"; continue; }
+        (
+            COMPONENT="${comp}"
+            COMPONENT_DIR="${dir}"
+            NAME=""; DESC=""
+            # 默认六函数（do_install/configure/start/stop/status/help）
+            do_install()   { return 0; }
+            do_configure() { return 0; }
+            do_start()     { return 0; }
+            do_stop()      { return 0; }
+            do_status()    { return 0; }
+            do_help()      { return 0; }
+            . "${dir}/deploy.conf" 2>/dev/null
+            [ -f "${dir}/deploy.sh" ] && . "${dir}/deploy.sh"
+            eval "${action}"
+        ) || { warn "组件 ${comp} 的 ${action} 失败"; rc=1; }
+    done
+    return ${rc}
+}
+
+# ---------------------------------------------------------------------------
+# DNS（core/net 复用；硬规则：getprop net.dns1/2 → 回退 8.8.8.8）
+# ---------------------------------------------------------------------------
+cm_dns_list()
+{
+    local dns list=""
+    if [ -n "${CM_GETPROP}" ]; then
+        dns="$(${CM_GETPROP} net.dns1 2>/dev/null)"
+        [ -n "${dns}" ] && list="${dns}"
+        dns="$(${CM_GETPROP} net.dns2 2>/dev/null)"
+        [ -n "${dns}" ] && list="${list} ${dns}"
+    fi
+    if [ -z "${list}" ] && [ -e /etc/resolv.conf ]; then
+        list="$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}')"
+    fi
+    [ -z "${list}" ] && list="8.8.8.8"
+    echo "${list}"
+}
+
+# ---------------------------------------------------------------------------
+# 发行版探测（三渠道归一：解压后读 /etc/os-release）
+# ---------------------------------------------------------------------------
+cm_distro_detect()
+{
+    local rootfs="$1" os id
+    os="${rootfs}/etc/os-release"
+    [ -r "${os}" ] || { echo "custom"; return 0; }
+    id="$(sed -n 's/^ID=//p' "${os}" 2>/dev/null | head -1 | tr -d '"')"
+    case "${id}" in
+        debian|ubuntu|kali|alpine|archarm|arch|fedora|centos|gentoo) echo "${id}" ;;
+        *) echo "custom" ;;
+    esac
+}
+
+# 压缩格式识别（magic bytes → tar 参数）
+cm_tar_detect()
+{
+    local f="$1" magic
+    magic="$(od -An -tx1 -N6 "$f" 2>/dev/null | tr -d ' \n')"
+    case "${magic}" in
+        fd377a585a00*) echo "J" ;;   # xz
+        425a68*)        echo "j" ;;   # bzip2
+        1f8b*)          echo "z" ;;   # gzip
+        28b52ffd*)      echo "--zstd" ;; # zstd
+        *)              echo "" ;;    # plain tar
+    esac
+}
+
+# cm_unpack <archive> <dest>  — 安全解压（拒绝绝对路径/.. 穿越由 tar 默认行为 + 后续校验）
+cm_unpack()
+{
+    local src="$1" dest="$2" opt
+    [ -f "${src}" ] || { err "归档不存在: ${src}"; return 1; }
+    mkdir -p "${dest}" || return 1
+    opt="$(cm_tar_detect "${src}")"
+    msg "- 解压 ${src##*/} -> ${dest} (opt=${opt:-none})"
+    if [ -n "${opt}" ]; then
+        ${CM_TAR} -x"${opt}"f "${src}" -C "${dest}" 2>&1 | tail -5
+    else
+        ${CM_TAR} -xf "${src}" -C "${dest}" 2>&1 | tail -5
+    fi
+    [ -d "${dest}/etc" ] || [ -d "${dest}/bin" ] || { err "解压结果不像 rootfs（无 etc/ 与 bin/）"; return 1; }
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 命令：diagnose — 能力矩阵探测（对应 §3.1 PD2338 实测表）
+# ---------------------------------------------------------------------------
+cmd_diagnose()
+{
+    cm_detect_tools
+    echo "=== ${PRODUCT} / chroot-mgr ${VERSION} — 能力诊断 ==="
+    echo
+    echo "[设备]"
+    [ -n "${CM_GETPROP}" ] && {
+        echo "  model   : $(${CM_GETPROP} ro.product.model 2>/dev/null)"
+        echo "  android : $(${CM_GETPROP} ro.build.version.release 2>/dev/null)"
+    }
+    echo "  kernel  : $(uname -r)"
+    echo "  arch    : $(uname -m)"
+    echo
+    echo "[内核能力]"
+    # MNT_NS 实测：unshare -m 挂 tmpfs
+    local mnt_ns=no
+    if [ -n "${CM_UNSHARE}" ]; then
+        # v0.1.8: ${CM_UNSHARE} 不加引号（多词命令变量约定），否则探测恒失败
+        if ${CM_UNSHARE} -m sh -c 'mkdir -p /data/adb/chroot-mgr/data/tmp/.nstest && \
+            mount -t tmpfs tmpfs /data/adb/chroot-mgr/data/tmp/.nstest' >/dev/null 2>&1; then
+            mnt_ns=yes
+            ${CM_UMOUNT} -l /data/adb/chroot-mgr/data/tmp/.nstest 2>/dev/null
+        fi
+    fi
+    echo "  CONFIG_MNT_NS  : ${mnt_ns}   $([ "${mnt_ns}" = yes ] && echo '(unshare -m + chroot 可用)' || echo '(退化为直接 chroot)')"
+    echo "  CONFIG_NET_NS  : $([ -e /proc/self/ns/net ] && echo yes || echo no)"
+    echo "  CONFIG_UTS_NS  : $([ -e /proc/self/ns/uts ] && echo yes || echo no)"
+    echo "  CONFIG_PID_NS  : $([ -e /proc/self/ns/pid ] && echo yes || echo 'no (容器内无 PID 隔离，跑不了 systemd)')"
+    echo "  CONFIG_USER_NS : $([ -e /proc/self/ns/user ] && echo yes || echo no)"
+    echo "  SELinux        : $([ -e /sys/fs/selinux/enforce ] && cat /sys/fs/selinux/enforce 2>/dev/null || echo 'n/a')"
+    echo
+    echo "[工具链]"
+    echo "  busybox : ${CM_BB:-none}"
+    echo "  unshare : ${CM_UNSHARE:-none}"
+    echo "  chroot  : ${CM_CHROOT:-none}"
+    echo "  tar     : ${CM_TAR:-none}"
+    echo "  wget    : ${CM_WGET:-none}"
+    echo "  getprop : ${CM_GETPROP:-none}"
+    echo
+    echo "[路径]"
+    echo "  module  : ${CM_MODDIR} $([ -d "${CM_MODDIR}" ] && echo '(ok)' || echo '(缺失!)')"
+    echo "  data    : ${CM_DATA_DIR} $([ -d "${CM_DATA_DIR}" ] && echo '(ok)' || echo '(缺失!)')"
+    echo "  include : ${CM_INCLUDE_DIR} $([ -d "${CM_INCLUDE_DIR}" ] && echo '(ok)' || echo '(缺失!)')"
+    echo "  distro  : ${CM_DISTRO_DIR} $([ -d "${CM_DISTRO_DIR}" ] && echo '(ok)' || echo '(缺失!)')"
+    echo
+    echo "[发行版支持]"
+    local d id name
+    if [ -d "${CM_DISTRO_DIR}" ]; then
+        for d in "${CM_DISTRO_DIR}"/*; do
+            [ -f "${d}/distro.conf" ] || continue
+            id="${d##*/}"; name="$(sed -n 's/^DISTRO_NAME="\{0,1\}\(.*\)/\1/p' "${d}/distro.conf" | sed 's/"$//' | head -1)"
+            printf "  %-14s %s\n" "${id}" "${name}"
+        done
+    fi
+    echo
+    echo "[已部署 profile]"
+    local p uname umarker
+    for p in $(cm_profile_list); do
+        uname="-"; umarker="未配置"
+        if [ -f "$(cm_user_mark "${p}")" ] && [ -f "$(cm_user_info "${p}")" ]; then
+            . "$(cm_user_info "${p}")" 2>/dev/null
+            uname="${USER_NAME:-?}"
+            umarker="已配置"
+        fi
+        printf "  %-14s %-10s (%-10s) user=%-8s [%s]\n" "${p}" \
+            "$(cm_profile_get "${p}" DISTRO)" \
+            "$(cm_profile_get "${p}" SUITE)" \
+            "${uname}" "${umarker}"
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 命令：status — 机器可读状态（D7 / §8.2）
+# ---------------------------------------------------------------------------
+cmd_status()
+{
+    cm_detect_tools
+    # v0.1.16: 对账后再上报——App 3s 轮询走这里，保证 UI 永远看到与实况
+    # （进程 + 挂载）一致的 state，而非会话退出后卡死的陈旧 running。
+    cm_state_reconcile
+
+    case "$1" in
+        --field)
+            case "$2" in
+                active) echo "${S_ACTIVE}" ;;
+                state)  echo "${S_STATE}" ;;
+                pid)    echo "${S_PID}" ;;
+                distro) echo "${S_DISTRO}" ;;
+                error)  echo "${S_ERROR}" ;;
+                *)      echo "" ;;
+            esac
+            return 0
+            ;;
+        --mounts)
+            local id="$2"
+            [ -n "${id}" ] || id="${S_ACTIVE}"
+            [ -n "${id}" ] || { echo "(无活动容器)"; return 0; }
+            cm_mounts_of "$(cm_profile_rootfs "${id}")" | sed "s|$(cm_profile_rootfs "${id}")/*|/|g"
+            return 0
+            ;;
+        --json)
+            echo "{"
+            echo "  \"version\": \"$(cm_json_escape "${VERSION}")\","
+            echo "  \"state\": \"$(cm_json_escape "${S_STATE}")\","
+            echo "  \"engine\": \"chroot\","
+            echo "  \"active\": \"$(cm_json_escape "${S_ACTIVE}")\","
+            echo "  \"pid\": \"$(cm_json_escape "${S_PID}")\","
+            # v0.1.18: active 容器的进程守护状态（running/inactive），App 状态页可展示
+            local guard_state="inactive" guard_pid=""
+            if [ -n "${S_ACTIVE}" ]; then
+                guard_pid="$(cat "$(cm_guard_pidfile "${S_ACTIVE}")" 2>/dev/null)"
+                cm_pid_alive "${guard_pid}" && guard_state="running"
+            fi
+            echo "  \"guard\": \"$(cm_json_escape "${guard_state}")\","
+            # v0.1.24: 全局监督 daemon 状态（App 仪表盘"守护进程"条目数据源）
+            local daemon_state="inactive" daemon_pid=""
+            daemon_pid="$(cat "$(cm_daemon_pidfile)" 2>/dev/null)"
+            cm_pid_alive "${daemon_pid}" && daemon_state="running"
+            echo "  \"daemon\": \"$(cm_json_escape "${daemon_state}")\","
+            echo "  \"distro\": \"$(cm_json_escape "${S_DISTRO}")\","
+            echo "  \"error\": \"$(cm_json_escape "${S_ERROR}")\","
+            # v0.1.23: /proc/stat cpu 首行原始 jiffies 计数，App 相邻快照差分算
+            # 总体占用率。/proc/stat 为独立类型 proc_stat（appdomain 不可读，
+            # 同 loadavg 的 SELinux 限制），故由本 root 路径代读；无 su 环境或
+            # 读取失败时输出 null，App 侧保持 "-"。
+            echo "  \"cpu_stat\": $(awk 'NR==1{printf "\"%s %s %s %s %s %s %s %s\"", $2,$3,$4,$5,$6,$7,$8,$9; exit}' /proc/stat 2>/dev/null || echo null),"
+            echo "  \"updated\": ${S_UPDATED:-0},"
+            echo "  \"profiles\": ["
+            local first=1 p user_name user_uid user_configured
+            for p in $(cm_profile_list); do
+                [ "${first}" = "1" ] || echo ","
+                first=0
+                # v0.1.9: 每个 profile 附带 user_name / user_uid / user_configured
+                user_name=""; user_uid=""
+                user_configured="false"
+                if [ -f "$(cm_user_mark "${p}")" ] && [ -f "$(cm_user_info "${p}")" ]; then
+                    user_configured="true"
+                    . "$(cm_user_info "${p}")" 2>/dev/null
+                    user_name="${USER_NAME:-}"
+                    user_uid="${USER_UID:-}"
+                fi
+                printf '    {"id":"%s","distro":"%s","suite":"%s","state":"%s","size":"%s","user_name":"%s","user_uid":"%s","user_configured":%s}' \
+                    "$(cm_json_escape "${p}")" \
+                    "$(cm_json_escape "$(cm_profile_get "${p}" DISTRO)")" \
+                    "$(cm_json_escape "$(cm_profile_get "${p}" SUITE)")" \
+                    "$([ -f "$(cm_profile_dir "${p}")/.enabled" ] && echo enabled || echo disabled)" \
+                    "$(cm_json_escape "$(cm_profile_size "${p}")")" \
+                    "$(cm_json_escape "${user_name}")" \
+                    "$(cm_json_escape "${user_uid}")" \
+                    "${user_configured}"
+            done
+            [ "${first}" = "1" ] || echo ""
+            echo "  ]"
+            echo "}"
+            return 0
+            ;;
+    esac
+
+    # 默认人类 + 机器混合输出
+    echo "=== ${PRODUCT} status ==="
+    cm_state_read >/dev/null
+    echo "state   : ${S_STATE}"
+    echo "engine  : ${S_ENGINE} (unshare -m + chroot)"
+    echo "active  : ${S_ACTIVE:-none}"
+    echo "pid     : ${S_PID:-none}"
+    # v0.1.18: 进程守护状态
+    if [ -n "${S_ACTIVE}" ]; then
+        cm_guard_status "${S_ACTIVE}" | sed 's/^/guard   : /'
+    fi
+    echo "distro  : ${S_DISTRO:-none}"
+    [ -n "${S_ERROR}" ] && echo "error   : ${S_ERROR}"
+    echo "updated : ${S_UPDATED}"
+    echo
+    echo "profiles:"
+    local p id st user_str
+    local any=0
+    for p in $(cm_profile_list); do
+        any=1
+        id="${p}"
+        st="disabled"
+        [ -f "$(cm_profile_dir "${id}")/.enabled" ] && st="enabled"
+        [ "${id}" = "${S_ACTIVE}" ] && st="${S_STATE}"
+        user_str="-(未配置)"
+        if [ -f "$(cm_user_mark "${id}")" ] && [ -f "$(cm_user_info "${id}")" ]; then
+            . "$(cm_user_info "${id}")" 2>/dev/null
+            user_str="${USER_NAME:-?}(uid=${USER_UID:-?})"
+        fi
+        printf "  %-14s %-8s %-10s %-26s %s\n" "${id}" "$(cm_profile_get "${id}" DISTRO)" "${st}" \
+            "${user_str}" \
+            "$(cm_profile_size "${id}")"
+    done
+    [ "${any}" = "1" ] || echo "  (无已部署系统 — 用 'chroot-mgr install' 部署)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 命令：enable <id>
+# ---------------------------------------------------------------------------
+cmd_enable()
+{
+    local id="$1"
+    cm_detect_tools
+    cm_require_tools
+    cm_profile_require "${id}"
+
+    # 加载 profile 描述符
+    DISTRO=""; SUITE=""; ARCH=""; INIT_CLASS=""; PKG_FAMILY=""; INCLUDE=""; MOUNTS=""
+    . "$(cm_profile_conf "${id}")"
+    [ -n "${INCLUDE}" ] || INCLUDE="${CM_DEFAULT_INCLUDE}"
+
+    cm_state_reconcile
+    # D21 单实例约束（v0.1.16: reconcile 后判定——会话已退出的陈旧 running
+    # 已被对账降级为 enabled，不再误报"已有系统在运行"）
+    if [ -n "${S_ACTIVE}" ] && [ "${S_ACTIVE}" != "${id}" ]; then
+        case "${S_STATE}" in
+            running|starting|stopping)
+                die "已有系统在运行: ${S_ACTIVE}（state=${S_STATE}）。
+  单实例约束（D21）：同一时刻至多一个系统运行。
+  请先 'chroot-mgr disable ${S_ACTIVE}'，或直接用 'chroot-mgr switch ${id}' 原子切换。"
+                ;;
+        esac
+    fi
+
+    local rootfs; rootfs="$(cm_profile_rootfs "${id}")"
+
+    if [ -f "$(cm_profile_dir "${id}")/.enabled" ] && cm_is_mounted "${rootfs}/proc"; then
+        msg "容器已启用（幂等跳过）: ${id}"
+        [ "${S_STATE}" = "disabled" ] && cm_state_write enabled "${id}" "" ""
+        # 幂等路径也补拉守护：此前 enable 的守护可能已随容器/异常退出
+        cm_guard_start "${id}"
+        # v0.1.24: 全局监督 daemon 幂等拉起（quiet——已在跑则零输出）
+        cm_daemon_start 1
+        return 0
+    fi
+
+    msg "== 启用容器: ${id} (${DISTRO} ${SUITE}) =="
+    cm_state_write starting "${id}" "" ""
+
+    # 1) 挂载（幂等）
+    cm_mount_all "${rootfs}" || { cm_state_write error "${id}" "" "mount failed"; return 1; }
+
+    # 1.5) keepalive 迁移（v0.1.18）：必须在组件 start 之前——
+    #      cgroup 归属与 oom_score_adj 随 fork 继承，迁移本 shell 根进程
+    #      一步即覆盖之后 fork 的全部容器服务进程
+    cm_keepalive_migrate
+
+    # 2) 组件 configure + start（mnt/net/profile）
+    CHROOT_DIR="${rootfs}"
+    export CHROOT_DIR DISTRO SUITE ARCH INIT_CLASS PKG_FAMILY
+    cm_component_exec "do_configure" ${INCLUDE}
+    cm_component_exec "do_start" ${INCLUDE}
+
+    # 3) 落 flag + 状态
+    : > "$(cm_profile_dir "${id}")/.enabled"
+    cm_state_write enabled "${id}" "" ""
+
+    # 4) 进程守护（v0.1.18）：默认开启；无可守护服务时内部自动跳过。
+    #    在 state=enabled 之后启动，守护继承 1.5) 迁移后的安全 cgroup。
+    cm_guard_start "${id}"
+    # v0.1.24: 全局监督 daemon 随首个容器拉起（quiet；已在跑则幂等跳过）
+    cm_daemon_start 1
+
+    msg "完成: ${id} 已启用。进入: chroot-mgr enter ${id}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 命令：disable [id|--all]  （D22 终止序：组件 stop → 杀进程 → 校验 → umount）
+# ---------------------------------------------------------------------------
+cmd_disable()
+{
+    local target="$1"
+    cm_detect_tools
+    cm_state_read
+
+    local ids=""
+    if [ "${target}" = "--all" ]; then
+        ids="$(cm_profile_list)"
+    elif [ -n "${target}" ]; then
+        ids="${target}"
+    else
+        ids="${S_ACTIVE}"
+        [ -z "${ids}" ] && ids="$(cm_profile_list)"
+    fi
+    [ -n "${ids}" ] || { msg "无可停用的系统"; return 0; }
+
+    local rc=0 id
+    for id in ${ids}; do
+        if ! cm_profile_exists "${id}"; then
+            warn "profile 不存在，跳过: ${id}"; continue
+        fi
+        local rootfs; rootfs="$(cm_profile_rootfs "${id}")"
+        DISTRO=""; SUITE=""; ARCH=""; INIT_CLASS=""; PKG_FAMILY=""; INCLUDE=""; MOUNTS=""
+        . "$(cm_profile_conf "${id}")"
+        [ -n "${INCLUDE}" ] || INCLUDE="${CM_DEFAULT_INCLUDE}"
+
+        # 幂等：未挂也未启用 → 直接成功
+        if [ ! -f "$(cm_profile_dir "${id}")/.enabled" ] && [ -z "$(cm_mounts_of "${rootfs}")" ]; then
+            msg "容器已停止（幂等跳过）: ${id}"
+            continue
+        fi
+
+        msg "== 停止容器: ${id} =="
+        cm_state_write stopping "${id}" "" ""
+
+        # 0) 停进程守护（v0.1.18）：必须最先——守护会在组件 stop 后把服务拉活，
+        #    不先停它会让 D22 终止序的"校验清零"永远过不去
+        cm_guard_stop "${id}"
+
+        # 1) 组件 stop
+        CHROOT_DIR="${rootfs}"
+        export CHROOT_DIR DISTRO SUITE ARCH INIT_CLASS PKG_FAMILY
+        cm_component_exec "do_stop" ${INCLUDE}
+
+        # 2) 定向终止全部 chroot 进程（台账 + 兜底扫描）
+        local pids
+        pids="$(cm_pids_all "${id}")"
+        if [ -n "${pids}" ]; then
+            msg "- 终止 ${id} 相关进程: ${pids}"
+            if ! cm_kill_pids "${pids}"; then
+                cm_state_write error "${id}" "" "进程未能清零"
+                rc=1
+                continue
+            fi
+            # 校验清零
+            local left; left="$(cm_pids_all "${id}")"
+            if [ -n "${left}" ]; then
+                cm_state_write error "${id}" "" "残留进程: ${left}"
+                err "终止校验未通过，中止卸载（挂载保持，避免数据损坏）: ${left}"
+                rc=1
+                continue
+            fi
+            msg "- 进程清零校验通过"
+        else
+            msg "- 无进程台账（无活跃会话）"
+        fi
+
+        # 3) 逆序卸载 + 挂载清零校验
+        if ! cm_umount_all "${rootfs}"; then
+            cm_state_write error "${id}" "" "umount 残留"
+            rc=1
+            continue
+        fi
+        msg "- 挂载清零校验通过"
+
+        # 4) 清理状态
+        rm -f "$(cm_profile_dir "${id}")/.enabled"
+        rm -f "$(cm_profile_pids "${id}")"
+        cm_state_write disabled "" "" ""
+        msg "完成: ${id} 已停止并卸载"
+    done
+    # v0.1.24: 最后一个容器停止 → 立即终止全局监督 daemon（用户约束：容器
+    # 结束不留常驻）。空转自杀（CM_DAEMON_IDLE_TICKS）是外力卸载的兜底，
+    # 这里是 disable 成功路径的即时保证。
+    if [ "$(cm_daemon_active_count)" = "0" ]; then
+        cm_daemon_stop
+    fi
+    return ${rc}
+}
+
+# ---------------------------------------------------------------------------
+# 命令：uninstall <id> | --all | --purge  — v0.1.2 真正"卸载容器"（删 rootfs）
+#   区别于 disable（仅卸挂载）：
+#     disable   = 停组件 → 杀进程 → 校验清零 → 逆序 umount
+#                 （profile 目录、rootfs 全部保留，可再次 enable）
+#     uninstall = disable 之后 + rm -rf profile 目录与 rootfs
+#                 （容器彻底消失，磁盘空间回收）
+#   --purge    = uninstall --all + 清空整个数据目录 ${CM_DATA_DIR}
+#                 等价于 KSU 触发 uninstall.sh 中的"删数据"那部分
+#                 （模块代码目录的删除仍由 uninstall.sh 负责）
+#
+# 安全护栏：
+#   - 默认要确认（除非传 -y / --yes）
+#   - 严禁删 /data、/system、/sdcard
+#   - 路径必须是 ${CM_DATA_DIR} 下的子目录
+# ---------------------------------------------------------------------------
+cmd_uninstall()
+{
+    local target="" yes=0 mode="single"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all)   mode="all"; shift ;;
+            --purge)  mode="purge"; shift ;;
+            -y|--yes) yes=1; shift ;;
+            # v0.1.6: 与 enter/switch 一致支持 --name ID；历史遗留的 id=--name 坏 profile
+            # 用: uninstall --name --name -y（$2 按字面取值）或 uninstall -y -- --name
+            --name)
+                [ $# -ge 2 ] || { err "chroot-mgr uninstall --name 需要参数（profile id）"; return 2; }
+                target="$2"; shift 2 ;;
+            # v0.1.6: -- 分隔符 → 其后参数按字面 id 处理（可删以 - 开头的遗留目录）
+            --)
+                shift
+                [ $# -ge 1 ] || { err "chroot-mgr uninstall -- 需要参数（profile id）"; return 2; }
+                target="$1"; shift
+                [ $# -eq 0 ] || { err "多余参数: $*（-y 请放在 -- 之前）"; return 2; }
+                ;;
+            -*)      die "未知选项: $1（id 以 - 开头请用 --name 或 -- 传递: uninstall --name '$1' -y）" ;;
+            *)       target="$1"; shift ;;
+        esac
+    done
+
+    cm_detect_tools
+    cm_state_read
+
+    # 路径安全护栏：解析后必须是 ${CM_DATA_DIR} 下的子目录，避免误删 /data 等
+    case "${mode}" in
+        single)
+            [ -n "${target}" ] || die "用法: chroot-mgr uninstall <id> [-y] | --all [-y] | --purge [-y]"
+            cm_profile_exists "${target}" || die "profile 不存在: ${target}"
+            target="$(cm_sanitize_id "${target}")"  # 防止注入（必须先归一再比对）
+            [ -d "$(cm_profile_dir "${target}")" ] || die "profile 目录异常: $(cm_profile_dir "${target}")"
+            # 路径必须在 CM_DATA_DIR/profiles/ 下
+            case "$(cm_profile_dir "${target}")/" in
+                "${CM_PROFILES_DIR}/"*) ;;
+                *) die "路径越界: $(cm_profile_dir "${target}")" ;;
+            esac
+            [ "${yes}" = "1" ] || {
+                echo "即将删除容器 ${target}（含 rootfs $(cm_profile_rootfs "${target}"))，"
+                echo "  释放空间: $(du -x -sh "$(cm_profile_rootfs "${target}")" 2>/dev/null | awk '{print $1}')"
+                printf "确认? [y/N] "
+                read -r ans || die "未确认"
+                case "${ans}" in y|Y|yes|YES) ;; *) die "取消" ;; esac
+            }
+            msg "== 卸载容器: ${target} =="
+            cmd_disable "${target}" >/dev/null 2>&1
+            # 二次校验挂载清零（disable 失败时仍尝试 umount）
+            cm_umount_all "$(cm_profile_rootfs "${target}")" >/dev/null 2>&1
+            rm -rf "$(cm_profile_dir "${target}")"
+            # 清状态
+            cm_state_read
+            if [ "${S_ACTIVE}" = "${target}" ]; then
+                cm_state_write disabled "" "" ""
+            fi
+            msg "完成: ${target} 已卸载"
+            ;;
+        all)
+            local ids
+            ids="$(cm_profile_list)"
+            if [ -z "${ids}" ]; then
+                msg "无已部署容器"; return 0
+            fi
+            [ "${yes}" = "1" ] || {
+                echo "即将卸载所有容器: ${ids}"
+                printf "确认? [y/N] "
+                read -r ans || die "未确认"
+                case "${ans}" in y|Y|yes|YES) ;; *) die "取消" ;; esac
+            }
+            local rc=0 id
+            for id in ${ids}; do
+                cmd_uninstall --yes "${id}" || rc=1
+            done
+            return ${rc}
+            ;;
+        purge)
+            [ "${yes}" = "1" ] || {
+                echo "即将清空整个数据目录: ${CM_DATA_DIR}"
+                echo "  所有容器、profile、状态、日志都会被删除"
+                echo "  （模块代码目录不会被删，由 KSU 卸载器负责）"
+                printf "确认? [y/N] "
+                read -r ans || die "未确认"
+                case "${ans}" in y|Y|yes|YES) ;; *) die "取消" ;; esac
+            }
+            msg "== 清理数据目录: ${CM_DATA_DIR} =="
+            cmd_disable --all >/dev/null 2>&1
+            # v0.1.24: purge 清掉数据目录（含 .daemon.pid）前先显式停全局守护，
+            # 防止 daemon 失去 pidfile 后靠自检自愈期间误判新守护
+            cm_daemon_stop
+            # 兜底 force umount 任何残留指向
+            if [ -d "${CM_PROFILES_DIR}" ]; then
+                local i m
+                for i in 1 2 3; do
+                    local mnt; mnt="$(grep "${CM_DATA_DIR%/}" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r)"
+                    [ -n "${mnt}" ] || break
+                    for m in ${mnt}; do
+                        ${CM_UMOUNT} "${m}" 2>/dev/null || ${CM_UMOUNT} -l "${m}" 2>/dev/null
+                    done
+                done
+            fi
+            rm -rf "${CM_DATA_DIR}"
+            mkdir -p "${CM_DATA_DIR}/profiles" "${CM_DATA_DIR}/config" "${CM_DATA_DIR}/tmp"
+            : > "${CM_STATE_FILE}"
+            cm_state_write disabled "" "" ""
+            msg "完成: ${CM_DATA_DIR} 已清空"
+            ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 命令：enter [id|--name ID] [-- cmd...]
+#   v0.1.2 修复：原实现 `local id="$1"` 把第一个参数（包括 --name）当 id，
+#   导致 'chroot-mgr enter --name (ubuntu resolute)' 误把 --name 当成
+#   profile 名，后续 enable/挂载全部错位。改为 while+case 解析，
+#   与 cmd_install 保持一致。
+# ---------------------------------------------------------------------------
+# _enter_impl <force_root> <args...> — cmd_enter/cmd_root 共享实现（v0.1.14）
+#   force_root=1 → 以 root 进入（跳过首次用户配置 + 强制清空 SUDOBOX_USER_NAME）
+_enter_impl()
+{
+    local force_root="$1"; shift
+    local id="" cmd_args=""
+    # 解析选项，剩余的非选项参数作为 "chroot 内要执行的命令" 拼到 cmd_args
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)
+                [ $# -ge 2 ] || { err "chroot-mgr enter --name 需要参数（profile id）"; cmd_help; return 2; }
+                id="$2"; shift 2 ;;
+            --)      shift; cmd_args="$*"; break ;;
+            -h|--help) cmd_help; return 0 ;;
+            -*)
+                warn "未知选项: $1（忽略）"
+                shift
+                ;;
+            *)
+                if [ -z "${id}" ]; then
+                    id="$1"
+                    shift
+                else
+                    cmd_args="$*"
+                    break
+                fi
+                ;;
+        esac
+    done
+    cm_detect_tools
+    cm_require_tools
+    cm_state_read
+
+    [ -n "${id}" ] || id="${S_ACTIVE}"
+    [ -n "${id}" ] || id="$(cm_profile_list | head -1)"
+    cm_profile_require "${id}"
+
+    # v0.1.9: 首次进入 → 用户配置（cm_user_setup_if_needed 内部检查 .user_configured，
+    # 已配置则幂等跳过；未配置则交互 prompt 或静默用默认值）。
+    # 必须在 enable 之前：enable 后 rootfs 已挂载但 cm_chroot_exec 已能 mount，
+    # 顺序无关；放在 enable 之前让 useradd 的"首次"语义清晰——和 cmd_enable 的幂等
+    # "容器未启用，先启用"提示解耦。
+    # v0.1.14: root 专用入口（chroot-mgr root）跳过用户配置——root 进入是运维场景，
+    # 不应被非 root 用户的首次 prompt 打断；未配置留给之后的 enter 触发。
+    if [ "${force_root}" != "1" ]; then
+        cm_user_setup_if_needed "${id}" || return 1
+    fi
+
+    # 未启用则隐式 enable
+    if [ ! -f "$(cm_profile_dir "${id}")/.enabled" ] || ! cm_is_mounted "$(cm_profile_rootfs "${id}")/proc"; then
+        msg "容器未启用，先启用: ${id}"
+        cmd_enable "${id}" || return 1
+    fi
+
+    # shell 词拆分恢复给 helper（如果用户传了 'uname -a' 这种）
+    # v0.1.14: 显式 export（避免 VAR=x func 前缀在 mksh 对函数的
+    # 持久化/导出语义歧义——后台子进程必须能收到该标志）
+    if [ "${force_root}" = "1" ]; then
+        export SUDOBOX_FORCE_ROOT=1
+    else
+        export SUDOBOX_FORCE_ROOT=0
+    fi
+    if [ -n "${cmd_args}" ]; then
+        # 用 eval 拆分（cmd_args 已经过本函数的 shift，词边界已丢失，只能重新词分析）
+        # 注意：此处只信任 profile id 来源的 cmd_args，不来自用户输入
+        cm_enter_session "${id}" ${cmd_args}
+    else
+        cm_enter_session "${id}"
+    fi
+}
+
+# cmd_enter — 默认入口（落到已配置的非 root 用户；未配置时首次 prompt）
+cmd_enter()
+{
+    _enter_impl 0 "$@"
+}
+
+# ---------------------------------------------------------------------------
+# 命令：root [id|--name ID] [-- cmd...]  — root 专用入口（v0.1.14）
+#
+#   任何容器都以 root 进入：跳过首次用户配置，忽略 .user_info 中已配置的
+#   非 root 用户（SUDOBOX_FORCE_ROOT=1 → cm_enter_session 不导出用户名 →
+#   chroot-enter.sh 走 root fallback：bash -l 直落，不经 su/PAM/setpriv）。
+#   场景：容器内修复（usermod/userdel/passwd）、包管理、文件属主调整。
+# ---------------------------------------------------------------------------
+cmd_root()
+{
+    _enter_impl 1 "$@"
+}
+
+# ---------------------------------------------------------------------------
+# 命令：user-config [id] [--reset]  — 手动管理容器内非 root 用户配置（v0.1.9）
+#
+#   * 无 --reset 且未配置 → 触发 cm_user_setup_if_needed（interactive prompt）
+#   * 无 --reset 且已配置 → 显示当前用户信息（不修改）
+#   * --reset             → 删 .user_configured + .user_info；下次 enter 重新 prompt
+#                          注意：--reset 不动容器内已创建的 /etc/passwd/shadow 条目，
+#                          若需清理请进容器手动 userdel。
+#
+# 与 cmd_enter 的关系：
+#   cmd_enter 首次调用会自动调 cm_user_setup_if_needed，本命令是给运维/调试/重置
+#   场景的手动入口——例如 stdin 不是 TTY 但想强制重做、或者想看当前配的用户是谁。
+# ---------------------------------------------------------------------------
+cmd_user_config()
+{
+    local id="" arg
+    local reset=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --reset) reset=1; shift ;;
+            --name)
+                [ $# -ge 2 ] || { err "chroot-mgr user-config --name 需要参数（profile id）"; return 2; }
+                id="$2"; shift 2 ;;
+            --)
+                shift
+                [ $# -ge 1 ] || { err "chroot-mgr user-config -- 需要参数（profile id）"; return 2; }
+                id="$1"; shift
+                [ $# -eq 0 ] || { err "多余参数: $*"; return 2; }
+                ;;
+            -h|--help) cmd_help; return 0 ;;
+            -*)        err "未知选项: $1"; return 2 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    cm_detect_tools
+
+    # 与 enter/exec 保持一致：默认取 S_ACTIVE / 第一个 profile
+    if [ -z "${id}" ]; then
+        cm_state_read
+        id="${S_ACTIVE}"
+        [ -n "${id}" ] || id="$(cm_profile_list | head -1)"
+    fi
+    [ -n "${id}" ] || die "未指定 profile 且无已部署容器"
+    cm_profile_require "${id}"
+
+    local mark; mark="$(cm_user_mark "${id}")"
+    local info; info="$(cm_user_info "${id}")"
+
+    if [ "${reset}" = "1" ]; then
+        rm -f "${mark}" "${info}"
+        msg "已重置 ${id} 的用户配置：下次 enter 会重新 prompt"
+        msg "  提示：容器内的 /etc/passwd 条目未删除，需手动 userdel"
+        return 0
+    fi
+
+    # 已配置 → 显示现状（不改）
+    if [ -f "${mark}" ] && [ -f "${info}" ]; then
+        . "${info}"
+        msg "  :: ${id} 用户配置（已配置） ::"
+        msg "  USER_NAME : ${USER_NAME}"
+        msg "  USER_UID  : ${USER_UID:-?}"
+        msg "  入口      : su -l ${USER_NAME}（由 chroot-enter.sh 自动切换）"
+        msg "  重置      : chroot-mgr user-config ${id} --reset"
+        return 0
+    fi
+
+    # 未配置 → 触发首次配置
+    cm_user_setup_if_needed "${id}"
+}
+
+# ---------------------------------------------------------------------------
+# 命令：switch [id|--name ID] [-- cmd...]  — D22 进入前仲裁的原子入口
+#   1) 目标已在运行      → 直接 attach（重新进入）
+#   2) 无其他系统运行     → start → enter
+#   3) 他系统在运行       → 完整终止并校验清零 → 启动目标 → enter
+#   失败：目标保持 stopped，原系统状态如实标记（不静默）
+# ---------------------------------------------------------------------------
+cmd_switch()
+{
+    local target="" cmd_args="" no_enter=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)
+                [ $# -ge 2 ] || { err "chroot-mgr switch --name 需要参数（profile id）"; cmd_help; return 2; }
+                target="$2"; shift 2 ;;
+            # v0.1.16: App 专用——仲裁 + enable 后返回，不拉交互 shell。
+            # 此前 switch 的落点是 cmd_enter：App 经 su -c 调用时（无 tty）
+            # 会挂起一个交互 shell 直到 120s 超时，切换操作既慢又假死。
+            --no-enter) no_enter=1; shift ;;
+            --)      shift; cmd_args="$*"; break ;;
+            -*)      warn "未知选项: $1（忽略）"; shift ;;
+            *)
+                if [ -z "${target}" ]; then target="$1"; shift
+                else cmd_args="$*"; break
+                fi
+                ;;
+        esac
+    done
+    cm_detect_tools
+    cm_require_tools
+    cm_profile_require "${target}"
+    cm_state_reconcile
+
+    # 1) 目标已在运行 → 直接 attach
+    if [ "${S_ACTIVE}" = "${target}" ] && [ "${S_STATE}" = "running" ]; then
+        msg "目标已在运行，直接进入: ${target}"
+        if [ "${no_enter}" = "1" ]; then
+            msg "- --no-enter: 已运行即视为完成"
+            return 0
+        fi
+        if [ -n "${cmd_args}" ]; then
+            cm_enter_session "${target}" ${cmd_args}
+        else
+            cm_enter_session "${target}"
+        fi
+        return $?
+    fi
+
+    # 2) 无冲突 → 常规路径
+    if [ -z "${S_ACTIVE}" ] || [ "${S_ACTIVE}" = "${target}" ] ||
+       [ "${S_STATE}" = "disabled" ] || [ "${S_STATE}" = "enabled" ]; then
+        if [ "${no_enter}" = "1" ]; then
+            cmd_enable "${target}"
+            return $?
+        fi
+        if [ -n "${cmd_args}" ]; then
+            cmd_enter "${target}" ${cmd_args}
+        else
+            cmd_enter "${target}"
+        fi
+        return $?
+    fi
+
+    # 3) 他系统在运行 → 仲裁：先完整终止
+    local old="${S_ACTIVE}"
+    msg "== 单实例仲裁（D22）=="
+    msg "  当前运行: ${old} (state=${S_STATE})"
+    msg "  目标系统: ${target}"
+    msg "  → 先完整终止 ${old}（组件 stop → SIGTERM → ${CM_TERM_GRACE}s → SIGKILL → 清零校验）"
+
+    if ! cmd_disable "${old}"; then
+        err "仲裁失败：无法彻底终止 ${old}。已回滚——未启动 ${target}，请手动检查残留进程/挂载。"
+        cm_state_read
+        cm_state_write error "${old}" "${S_PID}" "switch 仲裁失败，未切换到 ${target}"
+        return 1
+    fi
+
+    # 二次校验：旧系统进程与挂载必须都清零，才放行启动
+    local rootfs_old; rootfs_old="$(cm_profile_rootfs "${old}")"
+    local left_mounts left_pids
+    left_pids="$(cm_pids_all "${old}")"
+    left_mounts="$(cm_mounts_of "${rootfs_old}")"
+    if [ -n "${left_pids}" ] || [ -n "${left_mounts}" ]; then
+        err "仲裁校验未通过：${old} 仍有残留（进程:${left_pids:-无} 挂载:${left_mounts:-无}）"
+        err "已回滚——未启动 ${target}。"
+        cm_state_write error "${old}" "" "switch 校验未通过"
+        return 1
+    fi
+    msg "  仲裁校验通过：${old} 进程与挂载均已清零"
+
+    # 4) 启动目标（--no-enter 到此为止；否则进入）
+    if [ "${no_enter}" = "1" ]; then
+        msg "  → 启动 ${target}（--no-enter）"
+        cmd_enable "${target}"
+        return $?
+    fi
+    msg "  → 启动并进入 ${target}"
+    if [ -n "${cmd_args}" ]; then
+        cmd_enter "${target}" ${cmd_args}
+    else
+        cmd_enter "${target}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 命令：exec <cmd...>  — 在活动容器内执行一次性命令
+# ---------------------------------------------------------------------------
+cmd_exec()
+{
+    cm_detect_tools
+    cm_require_tools
+    cm_state_read
+    # v0.1.4 修复: 'shift 2>/dev/null' 在 $#=0 时仍会报"shift: nothing to shift"
+    # （shell builtin 错误不总能被 2>/dev/null 吞），改用 [ $# -gt 0 ] 守卫
+    local id=""
+    [ $# -gt 0 ] && { id="$1"; shift; }
+    [ -n "${id}" ] || id="${S_ACTIVE}"
+    cm_profile_require "${id}"
+    cmd_enable "${id}" >/dev/null 2>&1
+    cm_chroot_exec "$(cm_profile_rootfs "${id}")" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# 命令：svc list|start|stop <name>  （A/B 分级，§4）
+# ---------------------------------------------------------------------------
+cmd_svc()
+{
+    local action="$1" name="$2"
+    cm_detect_tools
+    cm_state_read
+    local id="$3"
+    [ -n "${id}" ] || id="${S_ACTIVE}"
+    cm_profile_require "${id}"
+    local rootfs; rootfs="$(cm_profile_rootfs "${id}")"
+
+    DISTRO=""; INIT_CLASS=""; INCLUDE=""
+    . "$(cm_profile_conf "${id}")"
+
+    case "${action}" in
+        list)
+            echo "=== ${id} 服务列表 (init_class=${INIT_CLASS}) ==="
+            if [ "${INIT_CLASS}" = "A" ]; then
+                local f
+                for f in "${rootfs}"/etc/init.d/*; do
+                    [ -f "${f}" ] || continue
+                    [ -x "${f}" ] || continue
+                    case "${f##*/}" in
+                        README|skeleton|rc|rcS|single) continue ;;
+                    esac
+                    echo "  ${f##*/}"
+                done
+            else
+                echo "  (B 级发行版：无 init.d 脚本。服务以裸进程/前台方式运行，"
+                echo "   可用 'chroot-mgr exec ${id} <cmd>' 自行拉起，或安装 sysv 兼容脚本)"
+            fi
+            ;;
+        start|stop)
+            [ -n "${name}" ] || die "用法: chroot-mgr svc ${action} <name> [profile]"
+            if [ "${INIT_CLASS}" = "A" ]; then
+                local script="${rootfs}/etc/init.d/${name}"
+                [ -f "${script}" ] || die "服务脚本不存在: /etc/init.d/${name}"
+                chmod 0755 "${script}"
+                msg "- /etc/init.d/${name} ${action}"
+                cm_chroot_exec "${rootfs}" "/etc/init.d/${name}" "${action}"
+            else
+                die "B 级发行版无 init.d 服务脚本: ${name}
+  降级方案: chroot-mgr exec ${id} <binary> （前台 -D 模式），状态由 .state 记录"
+            fi
+            ;;
+        *)
+            die "用法: chroot-mgr svc list|start|stop <name> [profile]"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 命令：export <tar>  — 归档 rootfs
+# ---------------------------------------------------------------------------
+cmd_export()
+{
+    local out="$1" id="$2"
+    cm_detect_tools
+    cm_state_read
+    [ -n "${id}" ] || id="${S_ACTIVE}"
+    [ -n "${id}" ] || id="$(cm_profile_list | head -1)"
+    cm_profile_require "${id}"
+    [ -n "${out}" ] || die "用法: chroot-mgr export <file.tar.gz|tar.xz|tar.bz2> [profile]"
+    [ -n "${CM_TAR}" ] || die "未找到 tar"
+
+    local rootfs; rootfs="$(cm_profile_rootfs "${id}")"
+    msg "- 归档 ${id} -> ${out}"
+    case "${out}" in
+        *.tar.gz|*.tgz)  ${CM_TAR} -czf "${out}" --exclude='./dev/*' --exclude='./sys/*' --exclude='./proc/*' --exclude='./tmp/*' -C "${rootfs}" . ;;
+        *.tar.xz|*.txz)  ${CM_TAR} -cJf "${out}" --exclude='./dev/*' --exclude='./sys/*' --exclude='./proc/*' --exclude='./tmp/*' -C "${rootfs}" . ;;
+        *.tar.bz2|*.tbz) ${CM_TAR} -cjf "${out}" --exclude='./dev/*' --exclude='./sys/*' --exclude='./proc/*' --exclude='./tmp/*' -C "${rootfs}" . ;;
+        *.tar)           ${CM_TAR} -cf  "${out}" --exclude='./dev/*' --exclude='./sys/*' --exclude='./proc/*' --exclude='./tmp/*' -C "${rootfs}" . ;;
+        *)               die "不支持的归档后缀（支持 .tar / .tar.gz / .tar.xz / .tar.bz2）" ;;
+    esac
+    msg "完成: ${out} ($(du -h "${out}" 2>/dev/null | awk '{print $1}'))"
+}
+
+# ---------------------------------------------------------------------------
+# 命令：import <tar> [--name id]  — 渠道 C：自定义导入（复用 install 管线）
+# ---------------------------------------------------------------------------
+cmd_import()
+{
+    # 也被 cmd_install --import 委托调用（v0.1.6），src 为位置参数 $1
+    local src="$1"; shift
+    local id=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)
+                [ $# -ge 2 ] || { err "--name 需要参数（profile id）"; return 2; }
+                id="$2"; shift 2 ;;
+            *) err "未知参数: $1（用法: import <tar> [--name <id>]）"; return 2 ;;
+        esac
+    done
+    cm_do_install_import "${src}" "${id}"
+}
+
+# ---------------------------------------------------------------------------
+# install 管线：三渠道归一（tarball / debootstrap / import）
+# ---------------------------------------------------------------------------
+cm_do_install_import()
+{
+    local src="$1" id="$2"
+    cm_detect_tools
+    [ -n "${CM_TAR}" ] || die "未找到 tar，无法导入"
+    [ -n "${src}" ] || die "用法: chroot-mgr install --import <rootfs.tar[.gz|.xz|.bz2]> [--name <id>]"
+
+    local base; base="${src##*/}"
+    [ -n "${id}" ] || id="${base%%.*}"
+    # 用 cm_sanitize_id（内部是 printf）而非 echo：echo 多出的换行会被 tr 换成 '_',
+    # 导致每个导入的容器名尾部多一个下划线。
+    id="$(cm_sanitize_id "${id}")"
+    # v0.1.6: sanitize 后立即拒绝前导 '-'（在 mkdir rootfs 之前，避免再造坏目录）。
+    # 例: install --import x.tar --name（缺值）在旧版会产生 id=--name 的坏 profile。
+    case "${id}" in
+        -*)
+            die "非法 profile id（不能以 - 开头）: ${id}
+  提示: id 须以字母或数字开头，如 --name ubuntu-resolute"
+            ;;
+    esac
+
+    if cm_profile_exists "${id}"; then
+        die "profile 已存在: ${id}（先删除 ${CM_PROFILES_DIR}/${id} 或换 --name）"
+    fi
+
+    msg "== 导入 rootfs: ${src##*/} =="
+    local rootfs; rootfs="$(cm_profile_rootfs "${id}")"
+    mkdir -p "${rootfs}" || die "无法创建 ${rootfs}"
+
+    cm_unpack "${src}" "${rootfs}" || { rm -rf "$(cm_profile_dir "${id}")"; return 1; }
+
+    cm_finalize_profile "${id}" "import"
+}
+
+# 解压完成后的统一收尾：探测发行版 → 套描述符 → 跑 post_unpack 钩子 → 写 profile
+cm_finalize_profile()
+{
+    local id="$1" kind="$2"
+    local rootfs; rootfs="$(cm_profile_rootfs "${id}")"
+
+    # 1) 发行版探测（/etc/os-release）
+    local distro suite version arch init_class pkg_family
+    distro="$(cm_distro_detect "${rootfs}")"
+    suite=""; version=""; arch="$(uname -m)"
+    if [ -r "${rootfs}/etc/os-release" ]; then
+        suite="$(sed -n 's/^VERSION_CODENAME=//p' "${rootfs}/etc/os-release" | head -1 | tr -d '"')"
+        [ -z "${suite}" ] && suite="$(sed -n 's/^VERSION_ID=//p' "${rootfs}/etc/os-release" | head -1 | tr -d '"')"
+        version="$(sed -n 's/^PRETTY_NAME=//p' "${rootfs}/etc/os-release" | head -1 | tr -d '"')"
+    fi
+    case "${arch}" in aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; esac
+
+    # 2) 套用 distro 描述符（若存在），否则探测推断
+    init_class="A"; pkg_family="unknown"
+    if [ -f "${CM_DISTRO_DIR}/${distro}/distro.conf" ]; then
+        msg "- 命中描述符: ${distro}"
+        DISTRO_NAME=""; INIT_CLASS="A"; PKG_FAMILY="unknown"; SOURCE_KIND="tarball"
+        . "${CM_DISTRO_DIR}/${distro}/distro.conf"
+        init_class="${INIT_CLASS}"; pkg_family="${PKG_FAMILY}"
+    else
+        msg "- 未命中描述符，按探测推断: ${distro}"
+        if [ -d "${rootfs}/etc/init.d" ] && [ -n "$(ls -A "${rootfs}/etc/init.d" 2>/dev/null)" ]; then
+            init_class="A"
+        else
+            init_class="B"; warn "  无 /etc/init.d → 判定 B 级（systemd 单栖，服务需裸进程运行）"
+        fi
+        if [ -d "${rootfs}/etc/apt" ]; then pkg_family="apt"
+        elif [ -d "${rootfs}/etc/apk" ]; then pkg_family="apk"
+        elif [ -d "${rootfs}/etc/pacman.d" ]; then pkg_family="pacman"
+        elif [ -d "${rootfs}/etc/yum.repos.d" ] || [ -d "${rootfs}/etc/dnf" ]; then pkg_family="dnf"
+        fi
+    fi
+
+    # 3) 写 profile.conf
+    cm_profile_write_conf "${id}" "${distro}" "${suite}" "${arch}" "${init_class}" "${pkg_family}" "${kind}"
+    msg "- profile: ${id} [distro=${distro} suite=${suite} arch=${arch} init=${init_class} pkg=${pkg_family}]"
+    [ -n "${version}" ] && msg "- ${version}"
+
+    # 4) 跑 post_unpack 钩子（共享脚本库）
+    DISTRO="${distro}"; CHROOT_DIR="${rootfs}"; SUITE="${suite}"; ARCH="${arch}"
+    PKG_FAMILY="${pkg_family}"; INIT_CLASS="${init_class}"
+    export DISTRO CHROOT_DIR SUITE ARCH PKG_FAMILY INIT_CLASS
+
+    local hook hfile
+    HOOKS="seccomp-off-apt dns hosts"
+    [ -f "${CM_DISTRO_DIR}/${distro}/distro.conf" ] && HOOKS="$(sed -n 's/^POST_UNPACK="\{0,1\}\(.*\)/\1/p' "${CM_DISTRO_DIR}/${distro}/distro.conf" | sed 's/"$//' | head -1)"
+    for hook in ${HOOKS}; do
+        hfile="${CM_HOOKS_DIR}/${hook}.sh"
+        if [ -f "${hfile}" ]; then
+            msg "- 钩子: ${hook}"
+            ( . "${hfile}"; hook_run ) || warn "  钩子 ${hook} 返回非零（继续）"
+        else
+            warn "  钩子缺失: ${hook}"
+        fi
+    done
+
+    msg "完成: ${id} 已就绪。启用: chroot-mgr enable ${id}"
+    return 0
+}
+
+cmd_install()
+{
+    cm_detect_tools
+
+    case "$1" in
+        # v0.1.6: --import 委托 cmd_import 做 option 解析（缺参守卫在 cmd_import 内）。
+        # 旧代码直接 cm_do_install_import "$@"，会把 --name 当 $2（id）→ 产生 id=--name 的坏目录
+        --import) shift; cmd_import "$@" ;;
+        # v0.1.6: 裸 option 前置 → 明确用法错误，不进 cm_install_distro 当 distro 名
+        --name|--mirror)
+            err "用法: chroot-mgr install <distro> [suite] [--name <id>] [--mirror <M>]"
+            err "  ${1} 需要先给出发行版名"
+            return 2
+            ;;
+        --list)
+            echo "可用发行版描述符:"
+            local d id name suite
+            for d in "${CM_DISTRO_DIR}"/*; do
+                [ -f "${d}/distro.conf" ] || continue
+                id="${d##*/}"
+                name="$(sed -n 's/^DISTRO_NAME="\{0,1\}\(.*\)/\1/p' "${d}/distro.conf" | sed 's/"$//' | head -1)"
+                suite="$(sed -n 's/^DEFAULT_SUITE="\{0,1\}\(.*\)/\1/p' "${d}/distro.conf" | sed 's/"$//' | head -1)"
+                printf "  %-14s %-22s suite=%s\n" "${id}" "${name}" "${suite}"
+            done
+            echo
+            echo "自定义导入: chroot-mgr install --import <rootfs.tar[.gz|.xz|.bz2]> [--name <id>]"
+            ;;
+        "")
+            err "用法:"
+            err "  chroot-mgr install <distro> [suite] [--name <id>] [--mirror <tuna|aliyun|ustc|official>]"
+            err "  chroot-mgr install --import <rootfs.tar[.gz|.xz|.bz2]> [--name <id>]"
+            err "  chroot-mgr install --list"
+            return 1
+            ;;
+        *)
+            cm_install_distro "$@"
+            ;;
+    esac
+}
+
+# 渠道 A：官方 tarball 直下
+cm_install_distro()
+{
+    local distro="$1"; shift
+    local suite="" id="" mirror=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)
+                [ $# -ge 2 ] || { err "install --name 需要参数（profile id）"; return 2; }
+                id="$2"; shift 2 ;;
+            --mirror)
+                [ $# -ge 2 ] || { err "install --mirror 需要参数（URL）"; return 2; }
+                mirror="$2"; shift 2 ;;
+            *)        [ -z "${suite}" ] && { suite="$1"; shift; } || shift ;;
+        esac
+    done
+
+    local conf="${CM_DISTRO_DIR}/${distro}/distro.conf"
+    [ -f "${conf}" ] || die "无该发行版描述符: ${distro}（'chroot-mgr install --list' 查看可用）"
+
+    DISTRO_NAME=""; DISTRO_ID=""; DEFAULT_SUITE=""; SOURCE_KIND=""
+    SOURCE_URL=""; SOURCE_URL_TEMPLATE=""; SUITE_VERSION_MAP=""
+    INIT_CLASS="A"; PKG_FAMILY="unknown"; POST_UNPACK=""; ARCH_MAP="aarch64=arm64"
+    . "${conf}"
+
+    [ -n "${suite}" ] || suite="${DEFAULT_SUITE}"
+    [ -n "${id}" ] || id="${distro}-${suite}"
+    # 与其它入口保持一致：--name 是用户可控输入，必须归一化后再当目录名用。
+    id="$(cm_sanitize_id "${id}")"
+    [ "${SOURCE_KIND}" = "tarball" ] || die "描述符 ${distro} 的渠道为 '${SOURCE_KIND}'，本版本尚未在设备端实现。
+  建议：PC 侧预生成 rootfs 后 'chroot-mgr install --import <file> --name <id>'（渠道 B/C）
+  详见 ${CM_DISTRO_DIR}/${distro}/distro.conf 的头部说明"
+
+    [ -n "${CM_WGET}" ] || die "未找到 wget/curl，无法联网下载"
+
+    # --- 架构映射（uname -m -> 发行版架构标识） -------------------------------
+    local host_arch mapped_arch entry
+    host_arch="$(uname -m)"
+    mapped_arch="${host_arch}"
+    for entry in ${ARCH_MAP}; do
+        case "${entry}" in
+            "${host_arch}="*) mapped_arch="${entry#*=}" ;;
+        esac
+    done
+    msg "- 架构: ${host_arch} -> ${mapped_arch}"
+
+    # --- URL 解析：优先描述符自带的 distro.sh resolver ------------------------
+    local url=""
+    local resolver="${CM_DISTRO_DIR}/${distro}/distro.sh"
+    if [ -f "${resolver}" ]; then
+        ( . "${conf}"; . "${resolver}"; distro_resolve_url "${suite}" "${mapped_arch}" "${mirror}" ) > "${CM_TMP_DIR}/.url.$$" 2>"${CM_TMP_DIR}/.urlerr.$$"
+        url="$(cat "${CM_TMP_DIR}/.url.$$" 2>/dev/null)"
+        local uerr; uerr="$(cat "${CM_TMP_DIR}/.urlerr.$$" 2>/dev/null)"
+        rm -f "${CM_TMP_DIR}/.url.$$" "${CM_TMP_DIR}/.urlerr.$$"
+        [ -n "${uerr}" ] && { err "${uerr}"; return 1; }
+    fi
+
+    # 回退：模板占位符替换（{SUITE} {VERSION} {ARCH}）
+    if [ -z "${url}" ]; then
+        local version=""
+        for entry in ${SUITE_VERSION_MAP}; do
+            case "${entry}" in
+                "${suite}="*) version="${entry#*=}" ;;
+            esac
+        done
+        url="${SOURCE_URL_TEMPLATE}"
+        url="$(echo "${url}" | sed "s|{SUITE}|${suite}|g; s|{VERSION}|${version}|g; s|{ARCH}|${mapped_arch}|g")"
+    fi
+    [ -n "${url}" ] || die "无法解析下载 URL（检查 ${distro}/distro.conf 的 SOURCE_URL_TEMPLATE）"
+
+    # 镜像前缀替换（仅当描述符未自带 resolver 时）
+    if [ -n "${mirror}" ] && [ "${mirror}" != "official" ] && [ ! -f "${resolver}" ]; then
+        local murl
+        murl="$(eval "echo \${MIRROR_${mirror}}")"
+        [ -n "${murl}" ] && url="${murl}" && msg "- 镜像: ${mirror}"
+    fi
+
+    # 传给 post_unpack 钩子（如 apk-repos 换源）
+    SUDOBOX_MIRROR="${mirror}"
+    export SUDOBOX_MIRROR
+
+    if cm_profile_exists "${id}"; then
+        die "profile 已存在: ${id}"
+    fi
+
+    msg "== 部署 ${DISTRO_NAME} ${suite} =="
+    msg "- 源: ${url}"
+
+    local tmp="${CM_TMP_DIR}/${id}.rootfs.tmp"
+    mkdir -p "${CM_TMP_DIR}"
+    rm -f "${tmp}"
+    if ! ${CM_WGET} -O "${tmp}" "${url}"; then
+        rm -f "${tmp}"
+        die "下载失败: ${url}"
+    fi
+    local size; size="$(du -h "${tmp}" 2>/dev/null | awk '{print $1}')"
+    msg "- 下载完成 (${size})"
+
+    local rootfs; rootfs="$(cm_profile_rootfs "${id}")"
+    mkdir -p "${rootfs}"
+    # Ubuntu base / Alpine minirootfs 内含 ./ 根目录，直接解
+    cm_unpack "${tmp}" "${rootfs}" || { rm -rf "$(cm_profile_dir "${id}")"; rm -f "${tmp}"; return 1; }
+    rm -f "${tmp}"
+
+    cm_finalize_profile "${id}" "${SOURCE_KIND}"
+}
+
+# ---------------------------------------------------------------------------
+# 命令：selftest — 纯逻辑自检（不触碰真实容器，可在任何 root 设备上跑）
+# ---------------------------------------------------------------------------
+cmd_selftest()
+{
+    cm_detect_tools
+    echo "=== ${PRODUCT} / chroot-mgr ${VERSION} 自检 ==="
+    local pass=0 fail=0 t
+    t="${CM_TMP_DIR}/selftest.$$"
+    mkdir -p "${t}"
+
+    _ck() { # _ck <描述> <期望> <实际>
+        if [ "$2" = "$3" ]; then
+            echo "  [OK]   $1"
+            pass=$((pass+1))
+        else
+            echo "  [FAIL] $1 (期望='$2' 实际='$3')"
+            fail=$((fail+1))
+        fi
+    }
+
+    echo "-- 压缩格式识别 (magic bytes)"
+    printf '\037\213\010' > "${t}/a.tar.gz"   2>/dev/null; _ck "gzip"  "z"      "$(cm_tar_detect "${t}/a.tar.gz")"
+    printf '\375\067\172\130\132\000' > "${t}/a.tar.xz" 2>/dev/null; _ck "xz"  "J"      "$(cm_tar_detect "${t}/a.tar.xz")"
+    printf '\102\132\150' > "${t}/a.tar.bz2"  2>/dev/null; _ck "bzip2" "j"      "$(cm_tar_detect "${t}/a.tar.bz2")"
+    printf '\050\265\057\375' > "${t}/a.tar.zst" 2>/dev/null; _ck "zstd" "--zstd" "$(cm_tar_detect "${t}/a.tar.zst")"
+    printf 'rootfs-data' > "${t}/a.tar"       2>/dev/null; _ck "plain tar" ""   "$(cm_tar_detect "${t}/a.tar")"
+
+    echo "-- DNS 兜底"
+    local dns; dns="$(cm_dns_list)"
+    [ -n "${dns}" ] && { echo "  [OK]   DNS 列表非空: ${dns}"; pass=$((pass+1)); } \
+                    || { echo "  [FAIL] DNS 列表为空"; fail=$((fail+1)); }
+
+    echo "-- 状态文件读写往返"
+    local bak="${CM_STATE_FILE}.bak.$$"
+    [ -f "${CM_STATE_FILE}" ] && cp "${CM_STATE_FILE}" "${bak}"
+    cm_state_write running "selftest" "4242" "boom"
+    cm_state_read
+    _ck "state"   "running"  "${S_STATE}"
+    _ck "active"  "selftest" "${S_ACTIVE}"
+    _ck "pid"     "4242"     "${S_PID}"
+    _ck "error"   "boom"     "${S_ERROR}"
+    cm_state_write disabled "" "" ""
+    [ -f "${bak}" ] && mv -f "${bak}" "${CM_STATE_FILE}"
+
+    echo "-- profile 描述符读写"
+    cm_profile_write_conf "selftest-prof" "ubuntu" "noble" "arm64" "A" "apt" "tarball"
+    _ck "profile DISTRO" "ubuntu" "$(cm_profile_get selftest-prof DISTRO)"
+    _ck "profile INIT"   "A"      "$(cm_profile_get selftest-prof INIT_CLASS)"
+    rm -rf "${CM_PROFILES_DIR}/selftest-prof"
+
+    echo "-- 工具链"
+    _ck "chroot 可用"  "yes" "$([ -n "${CM_CHROOT}" ] && echo yes || echo no)"
+    if [ -n "${CM_UNSHARE}" ]; then
+        echo "  [OK]   unshare 可用: ${CM_UNSHARE}"
+        pass=$((pass+1))
+        # v0.1.8: 整链调用实测——回归 v0.1.7 根因（${CM_UNSHARE} 加引号被整体当
+        # argv[0] → execve 失败 exit 127）。无引号展开后若仍失败说明内核/SELinux 真拒。
+        if ${CM_UNSHARE} -m /system/bin/true >/dev/null 2>&1; then
+            echo "  [OK]   unshare 整链调用: ${CM_UNSHARE} -m /system/bin/true → rc=0"
+            pass=$((pass+1))
+        else
+            echo "  [FAIL] unshare 整链调用失败（rc=$?）：${CM_UNSHARE} -m /system/bin/true"
+            fail=$((fail+1))
+        fi
+    else
+        echo "  [WARN] unshare 不可用（退化为直接 chroot）"
+    fi
+
+    rm -rf "${t}"
+    echo
+    echo "结果: ${pass} 通过 / ${fail} 失败"
+    [ "${fail}" = "0" ] || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 全局 PATH 注入（v0.1.21）
+#
+#   原理: KSU ksud 在每次 su 调用（含 su -c 非交互）时把 /data/adb/ksu/bin
+#         前置进 PATH（ksud/src/ksu.rs: add_path_to_env(BINARY_DIR)）。
+#         在该目录放 symlink → 所有 su 会话可直接调用本管理器，不写
+#         /system、/vendor、init、持久化属性（D11）。
+#
+#   临时性: symlink 仅在 su 执行瞬间由 ksud 动态注入生效——完整重启后临时
+#         root 消失 → 无 su → 注入不再发生 → 功能随 root 同生共死；软重启
+#         （framework/zygote restart）保留。
+#
+#   边界:   非 su 的 adb shell / Termux 等自管 PATH 的应用不受此机制影响
+#         （PATH 由各自父进程 env 决定，无法外部注入）。
+# ---------------------------------------------------------------------------
+CM_PATH_NAMES="chroot-mgr sudobox"
+CM_PATH_KSU_BIN="${SUDOBOX_KSU_BIN:-/data/adb/ksu/bin}"
+
+_cm_path_target()
+{
+    echo "${CM_MODDIR}/bin/chroot-mgr"
+}
+
+cmd_path()
+{
+    local action="${1:-status}"
+    [ $# -gt 0 ] && shift
+
+    local target name link lstate
+    target="$(_cm_path_target)"
+
+    case "${action}" in
+    install|enable)
+        [ -x "${target}" ] || { err "管理器本体不可执行: ${target}"; return 1; }
+        if [ ! -d "${CM_PATH_KSU_BIN}" ]; then
+            warn "${CM_PATH_KSU_BIN} 不存在（KSU 未注入或非 KSU 环境），尝试创建"
+            mkdir -p "${CM_PATH_KSU_BIN}" 2>/dev/null \
+                || { err "创建 ${CM_PATH_KSU_BIN} 失败，PATH 注入放弃"; return 1; }
+        fi
+        for name in ${CM_PATH_NAMES}; do
+            link="${CM_PATH_KSU_BIN}/${name}"
+            if [ -e "${link}" ] && [ ! -L "${link}" ]; then
+                warn "  [SKIP] ${link} 已存在且非 symlink，不覆盖用户文件"
+                continue
+            fi
+            if ln -sfn "${target}" "${link}" 2>/dev/null; then
+                msg "  [OK] ${link} -> ${target}"
+            else
+                warn "  [SKIP] ${name} symlink 创建失败（权限/SELinux）"
+            fi
+        done
+        # 幂等 marker（仅提示性，path status 使用）
+        printf 'installed=%s\ntarget=%s\n' "$(date '+%F %T')" "${target}" \
+            > "${CM_DATA_DIR}/.path_installed" 2>/dev/null
+        msg "完成。su 会话（含 su -c）现在可直接调用: chroot-mgr / sudobox"
+        msg "验证: su -c 'command -v chroot-mgr'"
+        ;;
+    remove|disable)
+        for name in ${CM_PATH_NAMES}; do
+            link="${CM_PATH_KSU_BIN}/${name}"
+            if [ -L "${link}" ]; then
+                # 只删指向本管理器的 symlink，不碰用户自己的文件
+                case "$(readlink "${link}" 2>/dev/null)" in
+                *chroot-mgr*)
+                    rm -f "${link}" 2>/dev/null \
+                        && msg "  [OK] 已移除 ${link}" \
+                        || warn "  [SKIP] ${link} 删除失败"
+                    ;;
+                *)
+                    warn "  [SKIP] ${link} 指向其它目标（$(readlink "${link}" 2>/dev/null)），不动"
+                    ;;
+                esac
+            fi
+        done
+        rm -f "${CM_DATA_DIR}/.path_installed" 2>/dev/null
+        msg "PATH 注入已移除"
+        ;;
+    status|"")
+        msg "== 全局 PATH 注入 (v0.1.21) =="
+        msg "ksu bin 目录 : ${CM_PATH_KSU_BIN} $([ -d "${CM_PATH_KSU_BIN}" ] && echo '(ok)' || echo '(缺失)')"
+        msg "管理器本体   : ${target} $([ -x "${target}" ] && echo '(ok)' || echo '(缺失/不可执行)')"
+        if [ -f "${CM_DATA_DIR}/.path_installed" ]; then
+            msg "marker       : 已安装 ($(sed -n 's/^installed=//p' "${CM_DATA_DIR}/.path_installed" 2>/dev/null | head -1))"
+        else
+            msg "marker       : 未安装"
+        fi
+        for name in ${CM_PATH_NAMES}; do
+            link="${CM_PATH_KSU_BIN}/${name}"
+            if [ -L "${link}" ]; then
+                case "$(readlink "${link}" 2>/dev/null)" in
+                *chroot-mgr*) lstate="(本模块)" ;;
+                *)            lstate="(他人)"   ;;
+                esac
+            elif [ -e "${link}" ]; then
+                lstate="(非symlink文件)"
+            else
+                lstate="(未注入)"
+            fi
+            msg "  ${name}: ${lstate}"
+        done
+        msg "提示: 非 su 的 adb shell / Termux 不受此机制影响（PATH 由各自父进程决定）"
+        ;;
+    -h|--help)
+        cat <<'EOF'
+USAGE: chroot-mgr path install|remove|status
+  install  把 chroot-mgr/sudobox symlink 进 /data/adb/ksu/bin（su 会话 PATH）
+  remove   移除本模块创建的 symlink（不动他人文件）
+  status   查看注入状态
+EOF
+        ;;
+    *) err "未知子命令: ${action}"; cmd_help; return 2 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# help
+# ---------------------------------------------------------------------------
+cmd_help()
+{
+cat <<EOF
+${PRODUCT} / chroot-mgr ${VERSION} — 按需提权，即用即还
+引擎: unshare -m + chroot（单一引擎，root 单形态）
+
+USAGE:
+  chroot-mgr <command> [args]
+
+COMMANDS:
+  install <distro> [suite] [--name ID] [--mirror M]   部署发行版（渠道 A: 官方 tarball）
+  install --import <file.tar[.gz|.xz|.bz2]> [--name ID]  导入自定义 rootfs（渠道 C）
+  install --list                                      列出可用发行版描述符
+  enable  <profile>                                   挂载并启用容器（幂等）
+  disable [profile|--all]                             停组件→杀进程→校验→逆序卸载（幂等）
+  uninstall <profile|--name ID|--all|--purge> [-y]  彻底卸载容器（disable + 删 rootfs，v0.1.2）
+                                                      --all 删全部，--purge 清空数据目录
+                                                      --name ID 与 -- 分隔符可删以 - 开头的 id
+  enter   [profile|--name ID] [-- cmd]                进入容器（自动启用 + 首次配置非 root 用户，v0.1.9）
+  root    [profile|--name ID] [-- cmd]                以 root 进入容器（跳过用户配置，v0.1.14）
+                                                      任何发行版通用：不经 setpriv/su/PAM，bash -l 直落
+  user-config [profile|--name ID] [--reset]          查看/重置容器内用户配置（v0.1.9）
+                                                      --reset 清标志，下次 enter 重做
+  switch  <profile|--name ID>                         单实例仲裁切换（D22：先终止旧系统并校验清零）
+  exec    <profile> <cmd...>                          在容器内执行一次命令
+  svc     list|start|stop <name> [profile]            服务管理（A/B 分级）
+  guard   start|stop|status [profile]                 进程守护（v0.1.18）：服务崩溃自动重启；
+                                                      enable/disable 自动启停，此为手动入口。
+                                                      守护清单 = profile.conf GUARD_SERVICES
+                                                      （未配置时 auto：存在 /etc/init.d/sshd 则守护 sshd）
+  daemon  start [--boot]|stop|status                  全局监督守护（v0.1.24）：状态对账 tick +
+                                                      boot-restore 执行者 + 事件日志；enable 自动
+                                                      拉起，末容器 disable 即杀，空转自杀兜底——
+                                                      容器结束不留常驻。
+  export  <file.tar.gz|tar.xz|tar.bz2> [profile]      归档 rootfs
+  import  <file.tar...> [--name ID]                   恢复归档为新 profile
+  path    install|remove|status               全局 PATH 注入（v0.1.21）：symlink 进
+                                              /data/adb/ksu/bin，su 会话（含 su -c）直接
+                                              可调 chroot-mgr/sudobox；生效前提是 ksud 在
+                                              跑 → 与临时 root 同生共死，不写 /system（D11）
+  status  [--json|--field F|--mounts]                 状态（机器可读）
+  diagnose                                            内核能力矩阵与工具链探测
+  selftest                                            纯逻辑自检（不触碰容器）
+  help                                                本帮助
+
+FIRST-RUN USER SETUP (v0.1.9):
+  首次 enter <profile> 时，cmd_enter 会检查 .user_configured 标志位：
+    - 缺失 + stdin 是 TTY → 交互 prompt 用户名/UID/密码（默认 android/1000/android）
+    - 缺失 + stdin 非 TTY → 静默用默认 android/1000/android（App 启动场景）
+    - 存在 → 幂等跳过，登录落到该非 root 用户（chroot-enter.sh 自动 su -l）
+  容器内 useradd/chpasswd 由 cm_user_setup_if_needed 调用 cm_chroot_exec 完成；
+  标志位与用户名持久化在 ${CM_PROFILES_DIR}/<id>/.user_configured 与 .user_info。
+  紧急入口：root 密码被清空（chpasswd + passwd -d 双兜底），容器内 su - root
+  可直接回 root 不需要密码。
+  重置:    chroot-mgr user-config <id> --reset
+
+STATE MODEL:
+  state  ∈ {disabled, enabled, running, starting, stopping, error}
+  active = 处于 running/starting 的 profile（全局至多一个，D21 单实例）
+
+PATHS:
+  模块代码 : ${CM_MODDIR}          （升级被整体替换）
+  数据目录 : ${CM_DATA_DIR}   （升级不动，uninstall.sh 全清）
+  状态文件 : ${CM_STATE_FILE}
+
+TOOLCHAIN:
+  busybox : ${CM_BINDIR}/busybox 优先（v0.1.2+ 模块自带，aarch64 静态 musl）
+  备用路径: /data/adb/ksu/bin/busybox → /system/bin/toybox → /system/bin/busybox
+
+EXAMPLES:
+  su -c chroot-mgr diagnose
+  su -c chroot-mgr path install                 # su 会话全局可用 chroot-mgr/sudobox（v0.1.21）
+  su -c chroot-mgr path status                  # 查看注入状态
+  su -c chroot-mgr install ubuntu noble --mirror tuna
+  su -c chroot-mgr enter --name ubuntu           # v0.1.2: --name 与裸位置参数都支持
+  su -c chroot-mgr enter ubuntu
+  su -c chroot-mgr exec ubuntu apt update
+  su -c chroot-mgr switch alpine                 # 自动终止 ubuntu 并校验清零后进入 alpine
+  su -c chroot-mgr disable --all
+  su -c chroot-mgr uninstall --all -y            # 删全部容器（释放 rootfs 空间）
+  su -c chroot-mgr uninstall --purge -y          # 清空整个数据目录
+  su -c chroot-mgr uninstall --name --name -y    # v0.1.6: 删 id 恰为 '--name' 的历史遗留容器
+  su -c chroot-mgr uninstall -y -- --name        # v0.1.6: -- 分隔符等价写法
+
+NOTE:
+  profile id 命名（v0.1.6）:
+    - 必须以字母或数字开头，不能以 '-' 开头（option 语法冲突，创建时会被拒绝）
+    - 合法示例: ubuntu-resolute / alpine-3.22 / my_box.2 / dev_env
+    - 历史遗留的 id=--name 坏目录（v0.1.3 旧 bug 产生）删法见上两条 EXAMPLES
+  disable ≠ uninstall：
+    disable   保留 rootfs 与 profile，可再次 enable
+    uninstall 删 profile 与 rootfs，磁盘空间回收（v0.1.2 起支持）
+  uninstall.sh 仍负责模块代码目录的删除（KSU 卸载器自动触发）
+
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 入口分派
+# ---------------------------------------------------------------------------
+main()
+{
+    [ -d "${CM_DATA_DIR}" ] || mkdir -p "${CM_DATA_DIR}/profiles" "${CM_DATA_DIR}/config" "${CM_DATA_DIR}/tmp"
+
+    local cmd="$1"
+    [ $# -gt 0 ] && shift
+
+    case "${cmd}" in
+        ""|help|-h|--help) cmd_help ;;
+        diagnose)  cmd_diagnose "$@" ;;
+        selftest)  cmd_selftest "$@" ;;
+        status)    cmd_status "$@" ;;
+        enable)    cmd_enable "$@" ;;
+        disable)   cmd_disable "$@" ;;
+        uninstall) cmd_uninstall "$@" ;;
+        remove)    cmd_uninstall "$@" ;;     # alias
+        enter)     cmd_enter "$@" ;;
+        root)      cmd_root "$@" ;;
+        root-shell) cmd_root "$@" ;;
+        switch)    cmd_switch "$@" ;;
+        path)      cmd_path "$@" ;;
+        user-config|user_config|userconfig) cmd_user_config "$@" ;;
+        exec)      cmd_exec "$@" ;;
+        svc)       cmd_svc "$@" ;;
+        guard)     cmd_guard "$@" ;;
+        daemon)    cmd_daemon "$@" ;;
+        # v0.1.18: 隐藏命令——cm_guard_start 双重 fork 的守护循环体，勿手动调用。
+        # 注意 main() 已 shift 过命令名，此处 $@ 即 profile id，无需再 shift。
+        _guard-loop)
+            cm_detect_tools
+            cm_guard_loop "$@"
+            ;;
+        # v0.1.24: 隐藏命令——cm_daemon_start 双重 fork 的全局监督循环体。
+        # $1 = boot_restore（0/1），main() 已 shift 过命令名。
+        _daemon-loop)
+            cm_detect_tools
+            cm_daemon_loop "${1:-0}"
+            ;;
+        export)    cmd_export "$@" ;;
+        import)    cmd_import "$@" ;;
+        install)   cmd_install "$@" ;;
+        version|-v|--version) echo "${PRODUCT}/chroot-mgr ${VERSION}" ;;
+        *)         err "未知命令: ${cmd}"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
